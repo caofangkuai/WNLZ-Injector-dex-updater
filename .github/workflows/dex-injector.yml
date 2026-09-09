@@ -105,10 +105,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests
+          pip install requests androguard
           sudo apt-get update -qq && sudo apt-get install -y -qq unzip wget file
 
-      - name: Resolve APK URL and version
+      - name: Resolve APK URL
         id: resolve
         run: |
           python3 << 'PYEOF'
@@ -122,7 +122,6 @@ jobs:
 
           # Get trigger event name
           trigger_event = os.environ.get("GITHUB_EVENT_NAME", "")
-          is_workflow_dispatch = trigger_event == "workflow_dispatch"
 
           # Determine if triggered by core.dex update
           is_core_dex_trigger = False
@@ -140,23 +139,17 @@ jobs:
           print(f"Is core.dex trigger: {is_core_dex_trigger}")
 
           apk_url = None
-          version = None
 
-          if apk_url_input and version_input:
+          if apk_url_input:
               apk_url = apk_url_input
-              version = version_input
-          elif apk_url_input or version_input:
-              print("::error::APK URL and version must both be provided or both be empty")
-              sys.exit(1)
           else:
               # Auto-detect from API
-              print("Auto-detecting latest version...")
+              print("Auto-detecting latest APK URL...")
               try:
                   resp = requests.get("https://adl.netease.com/d/g/mc/c/gwnew?type=android", timeout=30)
                   resp.raise_for_status()
                   content = resp.text
 
-                  # Parse URL from response
                   for line in content.split("\n"):
                       line = line.strip()
                       if 'var android_link = android_type ? "' in line:
@@ -166,7 +159,6 @@ jobs:
                               break
 
                   if not apk_url:
-                      # Try alternative pattern
                       for line in content.split("\n"):
                           line = line.strip()
                           if 'android_link' in line and 'http' in line:
@@ -181,34 +173,24 @@ jobs:
 
                   print(f"Found APK URL: {apk_url}")
 
-                  # Extract version from URL
-                  version_match = re.search(r'(\d+\.\d+\.\d+[\._]\d+)', apk_url)
-                  if version_match:
-                      version = version_match.group(1)
-                  else:
-                      version = "unknown"
-
-                  print(f"Detected version: {version}")
-
               except Exception as e:
-                  print(f"::error::Failed to auto-detect version: {e}")
+                  print(f"::error::Failed to auto-detect APK URL: {e}")
                   sys.exit(1)
 
           # Output results
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"apk_url={apk_url}\n")
-              f.write(f"version={version}\n")
+              f.write(f"version_input={version_input}\n")
               f.write(f"is_core_dex_trigger={str(is_core_dex_trigger).lower()}\n")
 
           print(f"apk_url={apk_url}")
-          print(f"version={version}")
           PYEOF
 
       - name: Check if release already exists
         id: check_release
         if: steps.resolve.outputs.is_core_dex_trigger != 'true'
         run: |
-          VERSION="${{ steps.resolve.outputs.version }}"
+          VERSION="${{ steps.manifest_version.outputs.version }}"
           TARGET_REPO="${{ secrets.TARGET_REPO }}"
 
           if [ -z "$TARGET_REPO" ] || [ -z "${{ secrets.ACCESS_TOKEN }}" ]; then
@@ -253,63 +235,50 @@ jobs:
         run: |
           APK_URL="${{ steps.resolve.outputs.apk_url }}"
           echo "Downloading APK from: $APK_URL"
-          wget -q --show-progress -O app.apk "$APK_URL"
+          wget -q -O app.apk "$APK_URL"
           ls -la app.apk
 
-      - name: Extract files from APK
-        if: env.SKIP_REMAINING != 'true'
-        run: |
-          mkdir -p apk_extracted
-          cd apk_extracted
-
-          # Extract only the files we need from assets
-          unzip -o ../app.apk "assets/_ntcfg_.data" 2>/dev/null || true
-          unzip -o ../app.apk "assets/_ntcfgss*.dat" 2>/dev/null || true
-
-          echo "Extracted files:"
-          ls -la assets/ 2>/dev/null || echo "No assets directory"
-
-          # If not found in assets, try root
-          if [ ! -f "assets/_ntcfg_.data" ]; then
-            unzip -o ../app.apk "_ntcfg_.data" 2>/dev/null || true
-            unzip -o ../app.apk "_ntcfgss*.dat" 2>/dev/null || true
-          fi
-
-          cd ..
-
-      - name: Get version from AndroidManifest if needed
+      - name: Get version and extract files
         if: env.SKIP_REMAINING != 'true'
         id: manifest_version
         run: |
-          VERSION="${{ steps.resolve.outputs.version }}"
-          if [ "$VERSION" = "unknown" ] || [ -z "$VERSION" ]; then
-            echo "Trying to extract version from AndroidManifest.xml..."
-            mkdir -p apk_full
-            cd apk_full
-            unzip -o ../app.apk "AndroidManifest.xml" 2>/dev/null || true
+          VERSION_INPUT="${{ steps.resolve.outputs.version_input }}"
 
-            # Try to use aapt
-            if command -v aapt &> /dev/null; then
-              VERSION=$(aapt dump badging ../app.apk 2>/dev/null | grep versionName | head -1 | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
-            fi
-
-            # If still no version, try to extract from APK
-            if [ -z "$VERSION" ]; then
-              APK_URL="${{ steps.resolve.outputs.apk_url }}"
-              VERSION=$(echo "$APK_URL" | grep -oP '\d+\.\d+\.\d+[\._]\d+' | head -1)
-            fi
-
-            if [ -n "$VERSION" ]; then
-              echo "version=$VERSION" >> $GITHUB_OUTPUT
-              echo "Resolved version: $VERSION"
-            else
-              echo "::error::Could not determine version"
+          if [ -n "$VERSION_INPUT" ]; then
+            echo "Using user-provided version: $VERSION_INPUT"
+            echo "version=$VERSION_INPUT" >> $GITHUB_OUTPUT
+          else
+            echo "Extracting version from APK..."
+            VERSION=$(python3 -c "
+          from androguard.core.apk import APK
+          apk = APK('app.apk')
+          name = apk.get_version_name()
+          code = apk.get_version_code()
+          if name and code:
+              print(f'{name}_{code}')
+          else:
+              print('unknown')
+          ")
+            if [ "$VERSION" = "unknown" ]; then
+              echo "::error::Could not extract version from APK"
               exit 1
             fi
-            cd ..
-          else
             echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Extracted version: $VERSION"
           fi
+
+          # Extract needed files from APK
+          mkdir -p apk_extracted/assets
+          unzip -o app.apk "assets/_ntcfg_.data" "assets/_ntcfgss*.dat" -d apk_extracted 2>/dev/null || true
+
+          # Fallback: try root if not in assets
+          if [ ! -f "apk_extracted/assets/_ntcfg_.data" ] && [ ! -f "apk_extracted/_ntcfg_.data" ]; then
+            unzip -o app.apk "_ntcfg_.data" "_ntcfgss*.dat" -d apk_extracted 2>/dev/null || true
+          fi
+
+          echo "Extracted files:"
+          find apk_extracted -type f -ls
+          rm -f app.apk
 
       - name: Decrypt DEX files
         if: env.SKIP_REMAINING != 'true'
@@ -374,43 +343,40 @@ jobs:
         with:
           path: |
             /tmp/android.jar
-            /tmp/d8
+            /tmp/d8.jar
           key: android-d8-v1
 
       - name: Download android.jar and d8
         if: env.SKIP_REMAINING != 'true' && steps.cache-android.outputs.cache-hit != 'true'
         run: |
-          mkdir -p /tmp/d8
-
           # Download android.jar stub from Sable's mirror
           curl -sL --max-time 120 \
             "https://github.com/Sable/android-platforms/raw/master/android-34/android.jar" \
             -o /tmp/android.jar
 
-          # Download d8 from build-tools R34
+          # Download d8 from build-tools R34 and extract d8.jar
           curl -sL --max-time 120 \
             "https://dl.google.com/android/repository/build-tools_r34-linux.zip" \
             -o /tmp/d8.zip
           mkdir -p /tmp/d8-extract
           unzip -q /tmp/d8.zip -d /tmp/d8-extract
-          find /tmp/d8-extract -name d8 -type f -exec cp {} /tmp/d8/d8 \;
-          chmod +x /tmp/d8/d8
+          find /tmp/d8-extract -name "d8.jar" -type f -exec cp {} /tmp/d8.jar \;
           rm -rf /tmp/d8.zip /tmp/d8-extract
 
-          ls -la /tmp/android.jar /tmp/d8/d8
+          ls -la /tmp/android.jar /tmp/d8.jar
 
       - name: Set D8 and android.jar paths
         if: env.SKIP_REMAINING != 'true'
         run: |
           echo "ANDROID_JAR=/tmp/android.jar" >> $GITHUB_ENV
-          echo "D8_PATH=/tmp/d8/d8" >> $GITHUB_ENV
+          echo "D8_CMD=java -jar /tmp/d8.jar" >> $GITHUB_ENV
 
       - name: Compile src to core.dex or decompile existing
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
 
-          D8_PATH="${{ env.D8_PATH }}"
+          D8_CMD="${{ env.D8_CMD }}"
 
           # Check if src directory exists with Java files
           if [ -d "../src" ] && [ "$(find ../src -name '*.java' | head -1)" ]; then
@@ -431,7 +397,7 @@ jobs:
             echo "Java compilation successful"
 
             # Convert class files to DEX using d8
-            $D8_PATH --output src_compile/ src_compile/classes/*.class 2>&1
+            $D8_CMD --output src_compile/ src_compile/classes/*.class 2>&1
 
             if [ $? -ne 0 ] || [ ! -f "src_compile/classes.dex" ]; then
               echo "::error::d8 compilation failed"
@@ -591,7 +557,7 @@ jobs:
       - name: Upload release asset
         if: env.SKIP_REMAINING != 'true'
         run: |
-          VERSION="${{ steps.resolve.outputs.version }}"
+          VERSION="${{ steps.manifest_version.outputs.version }}"
           TARGET_REPO="${{ secrets.TARGET_REPO }}"
 
           if [ -z "$TARGET_REPO" ] || [ -z "${{ secrets.ACCESS_TOKEN }}" ]; then
