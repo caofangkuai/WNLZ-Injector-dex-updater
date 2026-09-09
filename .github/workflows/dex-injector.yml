@@ -369,7 +369,7 @@ jobs:
         if: env.SKIP_REMAINING != 'true'
         run: |
           echo "ANDROID_JAR=/tmp/android.jar" >> $GITHUB_ENV
-          echo "D8_CMD=java -jar /tmp/d8.jar" >> $GITHUB_ENV
+          echo "D8_CMD=java -cp /tmp/d8.jar com.android.tools.r8.D8" >> $GITHUB_ENV
 
       - name: Compile src to core.dex or decompile existing
         if: env.SKIP_REMAINING != 'true'
