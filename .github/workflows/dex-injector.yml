@@ -1,0 +1,676 @@
+name: DEX Injector
+
+on:
+  push:
+    paths:
+      - '**.py'
+      - 'core.dex'
+      - 'src/**'
+      - '.github/workflows/**'
+  schedule:
+    - cron: '0 0 */7 * *'
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'APK 直链地址（留空则自动获取最新版）'
+        required: false
+        type: string
+      version:
+        description: '版本号（格式: 版本名称_版本号，如 3.9.15.297907_840297907）'
+        required: false
+        type: string
+
+env:
+  TARGET_REPO: ${{ secrets.TARGET_REPO }}
+  ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Cache baksmali/smali tools
+        uses: actions/cache@v4
+        with:
+          path: tools/
+          key: smali-tools-v1
+
+      - name: Download baksmali and smali
+        run: |
+          mkdir -p tools
+
+          # Function to download with fallback
+          download_tool() {
+            local tool_name=$1
+            local primary_url=$2
+            local fallback_url=$3
+            local output_file="tools/${tool_name}.jar"
+
+            if [ -f "$output_file" ] && [ -s "$output_file" ]; then
+              echo "${tool_name}.jar already cached"
+              return 0
+            fi
+
+            echo "Downloading ${tool_name}..."
+            curl -sL --max-time 60 "$primary_url" -o "$output_file" || true
+
+            # Verify it's a valid JAR
+            if [ ! -s "$output_file" ] || [ "$(file -b --mime-type "$output_file")" != "application/java-archive" ]; then
+              echo "Primary download failed, trying fallback..."
+              rm -f "$output_file"
+              curl -sL --max-time 60 "$fallback_url" -o "$output_file" || true
+            fi
+
+            # Final verification
+            if [ ! -s "$output_file" ] || [ "$(file -b --mime-type "$output_file")" != "application/java-archive" ]; then
+              echo "::error::Failed to download ${tool_name}"
+              rm -f "$output_file"
+              return 1
+            fi
+
+            echo "${tool_name} downloaded successfully"
+          }
+
+          # Try multiple sources
+          download_tool "baksmali" \
+            "https://github.com/JesusFreke/smali/releases/download/v3.0.8/baksmali-3.0.8.jar" \
+            "https://repo1.maven.org/maven2/org/smali/baksmali/3.0.8/baksmali-3.0.8.jar" || true
+
+          download_tool "smali" \
+            "https://github.com/JesusFreke/smali/releases/download/v3.0.8/smali-3.0.8.jar" \
+            "https://repo1.maven.org/maven2/org/smali/smali/3.0.8/smali-3.0.8.jar" || true
+
+          # If downloads failed, try building from source
+          if [ ! -f tools/baksmali.jar ] || [ ! -f tools/smali.jar ]; then
+            echo "Pre-built jars not available, will use alternative approach"
+          fi
+
+          ls -la tools/
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+          sudo apt-get update -qq && sudo apt-get install -y -qq unzip wget file
+
+      - name: Resolve APK URL and version
+        id: resolve
+        run: |
+          python3 << 'PYEOF'
+          import os
+          import re
+          import requests
+          import sys
+
+          apk_url_input = "${{ inputs.apk_url }}"
+          version_input = "${{ inputs.version }}"
+
+          # Get trigger event name
+          trigger_event = os.environ.get("GITHUB_EVENT_NAME", "")
+          is_workflow_dispatch = trigger_event == "workflow_dispatch"
+
+          # Determine if triggered by core.dex update
+          is_core_dex_trigger = False
+          if trigger_event == "push":
+              import subprocess
+              result = subprocess.run(
+                  ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
+                  capture_output=True, text=True
+              )
+              changed_files = result.stdout.strip().split("\n")
+              if "core.dex" in changed_files:
+                  is_core_dex_trigger = True
+
+          print(f"Trigger event: {trigger_event}")
+          print(f"Is core.dex trigger: {is_core_dex_trigger}")
+
+          apk_url = None
+          version = None
+
+          if apk_url_input and version_input:
+              apk_url = apk_url_input
+              version = version_input
+          elif apk_url_input or version_input:
+              print("::error::APK URL and version must both be provided or both be empty")
+              sys.exit(1)
+          else:
+              # Auto-detect from API
+              print("Auto-detecting latest version...")
+              try:
+                  resp = requests.get("https://adl.netease.com/d/g/mc/c/gwnew?type=android", timeout=30)
+                  resp.raise_for_status()
+                  content = resp.text
+
+                  # Parse URL from response
+                  for line in content.split("\n"):
+                      line = line.strip()
+                      if 'var android_link = android_type ? "' in line:
+                          match = re.search(r'var android_link = android_type \? "([^"]+)"', line)
+                          if match:
+                              apk_url = match.group(1)
+                              break
+
+                  if not apk_url:
+                      # Try alternative pattern
+                      for line in content.split("\n"):
+                          line = line.strip()
+                          if 'android_link' in line and 'http' in line:
+                              urls = re.findall(r'https?://[^\s"\']+', line)
+                              if urls:
+                                  apk_url = urls[0]
+                                  break
+
+                  if not apk_url:
+                      print("::error::Failed to find APK URL in API response")
+                      sys.exit(1)
+
+                  print(f"Found APK URL: {apk_url}")
+
+                  # Extract version from URL
+                  version_match = re.search(r'(\d+\.\d+\.\d+[\._]\d+)', apk_url)
+                  if version_match:
+                      version = version_match.group(1)
+                  else:
+                      version = "unknown"
+
+                  print(f"Detected version: {version}")
+
+              except Exception as e:
+                  print(f"::error::Failed to auto-detect version: {e}")
+                  sys.exit(1)
+
+          # Output results
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"apk_url={apk_url}\n")
+              f.write(f"version={version}\n")
+              f.write(f"is_core_dex_trigger={str(is_core_dex_trigger).lower()}\n")
+
+          print(f"apk_url={apk_url}")
+          print(f"version={version}")
+          PYEOF
+
+      - name: Check if release already exists
+        id: check_release
+        if: steps.resolve.outputs.is_core_dex_trigger != 'true'
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          TARGET_REPO="${{ secrets.TARGET_REPO }}"
+
+          if [ -z "$TARGET_REPO" ] || [ -z "${{ secrets.ACCESS_TOKEN }}" ]; then
+            echo "::error::TARGET_REPO or ACCESS_TOKEN secret is not set"
+            exit 1
+          fi
+
+          echo "Checking if release $VERSION exists in $TARGET_REPO..."
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+            "https://api.github.com/repos/$TARGET_REPO/releases/tags/$VERSION")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Release $VERSION already exists"
+            # Check if dex.zip asset exists
+            ASSET_EXISTS=$(curl -s \
+              -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+              "https://api.github.com/repos/$TARGET_REPO/releases/tags/$VERSION" | \
+              python3 -c "import sys,json; r=json.load(sys.stdin); print('true' if any(a['name']=='dex.zip' for a in r.get('assets',[])) else 'false')")
+
+            if [ "$ASSET_EXISTS" = "true" ]; then
+              echo "dex.zip asset already exists in release $VERSION"
+              echo "already_exists=true" >> $GITHUB_OUTPUT
+            else
+              echo "Release exists but no dex.zip asset"
+              echo "already_exists=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Release $VERSION does not exist"
+            echo "already_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Skip if already latest
+        if: steps.check_release.outputs.already_exists == 'true'
+        run: |
+          echo "已是最新版本，无需处理"
+          echo "SKIP_REMAINING=true" >> $GITHUB_ENV
+
+      - name: Download APK
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          APK_URL="${{ steps.resolve.outputs.apk_url }}"
+          echo "Downloading APK from: $APK_URL"
+          wget -q --show-progress -O app.apk "$APK_URL"
+          ls -la app.apk
+
+      - name: Extract files from APK
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          mkdir -p apk_extracted
+          cd apk_extracted
+
+          # Extract only the files we need from assets
+          unzip -o ../app.apk "assets/_ntcfg_.data" 2>/dev/null || true
+          unzip -o ../app.apk "assets/_ntcfgss*.dat" 2>/dev/null || true
+
+          echo "Extracted files:"
+          ls -la assets/ 2>/dev/null || echo "No assets directory"
+
+          # If not found in assets, try root
+          if [ ! -f "assets/_ntcfg_.data" ]; then
+            unzip -o ../app.apk "_ntcfg_.data" 2>/dev/null || true
+            unzip -o ../app.apk "_ntcfgss*.dat" 2>/dev/null || true
+          fi
+
+          cd ..
+
+      - name: Get version from AndroidManifest if needed
+        if: env.SKIP_REMAINING != 'true'
+        id: manifest_version
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          if [ "$VERSION" = "unknown" ] || [ -z "$VERSION" ]; then
+            echo "Trying to extract version from AndroidManifest.xml..."
+            mkdir -p apk_full
+            cd apk_full
+            unzip -o ../app.apk "AndroidManifest.xml" 2>/dev/null || true
+
+            # Try to use aapt
+            if command -v aapt &> /dev/null; then
+              VERSION=$(aapt dump badging ../app.apk 2>/dev/null | grep versionName | head -1 | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+            fi
+
+            # If still no version, try to extract from APK
+            if [ -z "$VERSION" ]; then
+              APK_URL="${{ steps.resolve.outputs.apk_url }}"
+              VERSION=$(echo "$APK_URL" | grep -oP '\d+\.\d+\.\d+[\._]\d+' | head -1)
+            fi
+
+            if [ -n "$VERSION" ]; then
+              echo "version=$VERSION" >> $GITHUB_OUTPUT
+              echo "Resolved version: $VERSION"
+            else
+              echo "::error::Could not determine version"
+              exit 1
+            fi
+            cd ..
+          else
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Decrypt DEX files
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          mkdir -p work
+          cd work
+
+          # Find the ntcfgss dat file
+          NTCFGSS_FILE=$(find ../apk_extracted -name "_ntcfgss*.dat" | head -1)
+          NTCFG_FILE=$(find ../apk_extracted -name "_ntcfg_.data" | head -1)
+
+          if [ -z "$NTCFGSS_FILE" ]; then
+            echo "::error::No _ntcfgss*.dat file found in APK"
+            exit 1
+          fi
+
+          if [ -z "$NTCFG_FILE" ]; then
+            echo "::warning::_ntcfg_.data not found, will use default keys"
+            NTCFG_FILE=""
+          fi
+
+          echo "Using ntcfgss file: $NTCFGSS_FILE"
+          echo "Using ntcfg file: $NTCFG_FILE"
+
+          # Determine the classes+dex filename from the ntcfgss filename
+          BASENAME=$(basename "$NTCFGSS_FILE")
+          DEX_NUM=$(echo "$BASENAME" | sed 's/_ntcfgss//;s/\.dat//')
+
+          if [ -z "$DEX_NUM" ]; then
+            DEX_NAME="classes.dex"
+          else
+            DEX_NAME="classes${DEX_NUM}.dex"
+          fi
+
+          echo "Target DEX name: $DEX_NAME"
+
+          # Decrypt the ntcfgss file
+          if [ -n "$NTCFG_FILE" ]; then
+            python3 ../dex_crypto_tool.py decrypt "$NTCFGSS_FILE" "$DEX_NAME" "$NTCFG_FILE"
+          else
+            python3 ../dex_crypto_tool.py decrypt "$NTCFGSS_FILE" "$DEX_NAME"
+          fi
+
+          if [ $? -ne 0 ]; then
+            echo "::error::Decryption failed"
+            exit 1
+          fi
+
+          echo "Decrypted DEX: $DEX_NAME"
+          ls -la "$DEX_NAME"
+
+          # Save variables for next steps
+          echo "DEX_NAME=$DEX_NAME" >> $GITHUB_ENV
+          echo "NTCFG_FILE=$NTCFG_FILE" >> $GITHUB_ENV
+          echo "NTCFGSS_FILE=$NTCFGSS_FILE" >> $GITHUB_ENV
+
+          cd ..
+
+      - name: Cache android.jar and d8
+        id: cache-android
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/android.jar
+            /tmp/d8
+          key: android-d8-v1
+
+      - name: Download android.jar and d8
+        if: env.SKIP_REMAINING != 'true' && steps.cache-android.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p /tmp/d8
+
+          # Download android.jar stub from Sable's mirror
+          curl -sL --max-time 120 \
+            "https://github.com/Sable/android-platforms/raw/master/android-34/android.jar" \
+            -o /tmp/android.jar
+
+          # Download d8 from build-tools R34
+          curl -sL --max-time 120 \
+            "https://dl.google.com/android/repository/build-tools_r34-linux.zip" \
+            -o /tmp/d8.zip
+          mkdir -p /tmp/d8-extract
+          unzip -q /tmp/d8.zip -d /tmp/d8-extract
+          find /tmp/d8-extract -name d8 -type f -exec cp {} /tmp/d8/d8 \;
+          chmod +x /tmp/d8/d8
+          rm -rf /tmp/d8.zip /tmp/d8-extract
+
+          ls -la /tmp/android.jar /tmp/d8/d8
+
+      - name: Set D8 and android.jar paths
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          echo "ANDROID_JAR=/tmp/android.jar" >> $GITHUB_ENV
+          echo "D8_PATH=/tmp/d8/d8" >> $GITHUB_ENV
+
+      - name: Compile src to core.dex or decompile existing
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          cd work
+
+          D8_PATH="${{ env.D8_PATH }}"
+
+          # Check if src directory exists with Java files
+          if [ -d "../src" ] && [ "$(find ../src -name '*.java' | head -1)" ]; then
+            echo "src/ directory found with Java source files"
+            echo "Compiling src/ to core.dex using d8..."
+
+            mkdir -p src_compile/classes
+
+            # Compile Java source to class files
+            find ../src -name '*.java' > src_compile/sources.txt
+            javac -source 1.8 -target 1.8 -bootclasspath "${{ env.ANDROID_JAR }}" -d src_compile/classes @src_compile/sources.txt 2>&1
+
+            if [ $? -ne 0 ]; then
+              echo "::error::Java compilation failed"
+              exit 1
+            fi
+
+            echo "Java compilation successful"
+
+            # Convert class files to DEX using d8
+            $D8_PATH --output src_compile/ src_compile/classes/*.class 2>&1
+
+            if [ $? -ne 0 ] || [ ! -f "src_compile/classes.dex" ]; then
+              echo "::error::d8 compilation failed"
+              exit 1
+            fi
+
+            echo "d8 compilation successful"
+            cp src_compile/classes.dex core_decrypted.dex
+            echo "Generated core.dex from src/ directory"
+            ls -la core_decrypted.dex
+
+          elif [ -f "../core.dex" ]; then
+            echo "No src/ directory found, decompiling existing core.dex..."
+
+            # Decrypt core.dex
+            if [ -n "$NTCFG_FILE" ]; then
+              python3 ../dex_crypto_tool.py decrypt ../core.dex core_decrypted.dex "$NTCFG_FILE"
+            else
+              python3 ../dex_crypto_tool.py decrypt ../core.dex core_decrypted.dex
+            fi
+
+            if [ $? -eq 0 ]; then
+              echo "Decrypted core.dex successfully"
+              ls -la core_decrypted.dex
+            else
+              echo "Failed to decrypt core.dex"
+              exit 1
+            fi
+          else
+            echo "No src/ directory and no core.dex found, skipping core.dex handling"
+          fi
+
+          cd ..
+
+      - name: Decompile DEX to smali
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          cd work
+          mkdir -p smali_work/smali_main smali_work/smali_core
+
+          # Decompile the main decrypted dex
+          if [ -f "../tools/baksmali.jar" ] && [ -s "../tools/baksmali.jar" ]; then
+            java -jar ../tools/baksmali.jar disassemble "$DEX_NAME" -o smali_work/smali_main
+          else
+            echo "::error::baksmali.jar not available"
+            exit 1
+          fi
+
+          # Decompile core_decrypted.dex if exists
+          if [ -f "core_decrypted.dex" ]; then
+            java -jar ../tools/baksmali.jar disassemble core_decrypted.dex -o smali_work/smali_core
+          fi
+
+          echo "Decompiled smali files"
+          ls -la smali_work/
+
+          cd ..
+
+      - name: Modify smali code
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          cd work
+
+          python3 ../smali_modifier.py smali_work
+
+          echo "Smali modification complete"
+
+          cd ..
+
+      - name: Recompile smali to DEX
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          cd work
+
+          # Recompile smali_main
+          if [ -d "smali_work/smali_main" ]; then
+            java -jar ../tools/smali.jar assemble smali_work/smali_main -o classes_recompiled.dex
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to recompile smali_main"
+              exit 1
+            fi
+            echo "Recompiled smali_main to classes_recompiled.dex"
+          fi
+
+          # Recompile smali_core if exists
+          if [ -d "smali_work/smali_core" ] && [ "$(ls -A smali_work/smali_core)" ]; then
+            java -jar ../tools/smali.jar assemble smali_work/smali_core -o core_recompiled.dex
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to recompile smali_core"
+              exit 1
+            fi
+            echo "Recompiled smali_core to core_recompiled.dex"
+          fi
+
+          ls -la *.dex
+
+          cd ..
+
+      - name: Encrypt DEX files
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          cd work
+          mkdir -p encrypted
+
+          NTCFG_FILE="$NTCFG_FILE"
+
+          # Encrypt all recompiled dex files
+          for dex in classes_recompiled.dex core_recompiled.dex; do
+            if [ -f "$dex" ]; then
+              OUTPUT="encrypted/${dex%.dex}_encrypted.dex"
+              if [ -n "$NTCFG_FILE" ]; then
+                python3 ../dex_crypto_tool.py encrypt "$dex" "$OUTPUT" "$NTCFG_FILE"
+              else
+                python3 ../dex_crypto_tool.py encrypt "$dex" "$OUTPUT"
+              fi
+              if [ $? -ne 0 ]; then
+                echo "::error::Failed to encrypt $dex"
+                exit 1
+              fi
+              echo "Encrypted $dex -> $OUTPUT"
+            fi
+          done
+
+          # Also encrypt the original decrypted dex if no recompilation happened
+          if [ ! -f "classes_recompiled.dex" ] && [ -f "$DEX_NAME" ]; then
+            if [ -n "$NTCFG_FILE" ]; then
+              python3 ../dex_crypto_tool.py encrypt "$DEX_NAME" "encrypted/${DEX_NAME%.dex}_encrypted.dex" "$NTCFG_FILE"
+            else
+              python3 ../dex_crypto_tool.py encrypt "$DEX_NAME" "encrypted/${DEX_NAME%.dex}_encrypted.dex"
+            fi
+          fi
+
+          echo "Encrypted files:"
+          ls -la encrypted/
+
+          cd ..
+
+      - name: Create dex.zip
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          cd work
+
+          # Create zip with all encrypted dex files
+          zip -j dex.zip encrypted/*.dex
+
+          if [ $? -ne 0 ]; then
+            echo "::error::Failed to create dex.zip"
+            exit 1
+          fi
+
+          echo "Created dex.zip:"
+          ls -la dex.zip
+          unzip -l dex.zip
+
+          cd ..
+
+      - name: Upload release asset
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          TARGET_REPO="${{ secrets.TARGET_REPO }}"
+
+          if [ -z "$TARGET_REPO" ] || [ -z "${{ secrets.ACCESS_TOKEN }}" ]; then
+            echo "::error::TARGET_REPO or ACCESS_TOKEN secret is not set"
+            exit 1
+          fi
+
+          # Check if release already exists
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+            "https://api.github.com/repos/$TARGET_REPO/releases/tags/$VERSION")
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Creating release $VERSION..."
+            # Create release
+            CREATE_RESPONSE=$(curl -s -X POST \
+              -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/$TARGET_REPO/releases" \
+              -d "{
+                \"tag_name\": \"$VERSION\",
+                \"name\": \"$VERSION\",
+                \"body\": \"Auto-generated release for version $VERSION\",
+                \"draft\": false,
+                \"prerelease\": false
+              }")
+
+            RELEASE_ID=$(echo "$CREATE_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+
+            if [ -z "$RELEASE_ID" ]; then
+              echo "::error::Failed to create release"
+              echo "$CREATE_RESPONSE"
+              exit 1
+            fi
+
+            echo "Created release with ID: $RELEASE_ID"
+          else
+            # Get existing release ID
+            RELEASE_ID=$(curl -s \
+              -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+              "https://api.github.com/repos/$TARGET_REPO/releases/tags/$VERSION" | \
+              python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+
+            echo "Using existing release with ID: $RELEASE_ID"
+          fi
+
+          # Delete existing dex.zip asset if exists
+          EXISTING_ASSET=$(curl -s \
+            -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+            "https://api.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets" | \
+            python3 -c "import sys,json; assets=json.load(sys.stdin); result=[a['id'] for a in assets if a['name']=='dex.zip']; print(result[0] if result else '')" 2>/dev/null)
+
+          if [ -n "$EXISTING_ASSET" ]; then
+            echo "Deleting existing asset ID: $EXISTING_ASSET"
+            curl -s -X DELETE \
+              -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+              "https://api.github.com/repos/$TARGET_REPO/releases/assets/$EXISTING_ASSET"
+          fi
+
+          # Upload dex.zip
+          echo "Uploading dex.zip..."
+          UPLOAD_RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+            -H "Content-Type: application/zip" \
+            --data-binary @work/dex.zip \
+            "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=dex.zip")
+
+          echo "Upload response: $UPLOAD_RESPONSE"
+
+          # Verify upload
+          if echo "$UPLOAD_RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); assert 'id' in r" 2>/dev/null; then
+            echo "Successfully uploaded dex.zip to release $VERSION"
+          else
+            echo "::error::Failed to upload dex.zip"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always() && env.SKIP_REMAINING != 'true'
+        run: |
+          rm -rf work apk_extracted apk_full app.apk
+          echo "Cleanup complete"
