@@ -297,54 +297,52 @@ jobs:
           mkdir -p work
           cd work
 
-          # Find the ntcfgss dat file
-          NTCFGSS_FILE=$(find ../apk_extracted -name "_ntcfgss*.dat" | head -1)
           NTCFG_FILE=$(find ../apk_extracted -name "_ntcfg_.data" | head -1)
+          if [ -z "$NTCFG_FILE" ]; then
+            echo "::warning::_ntcfg_.data not found, will use default keys"
+          fi
 
-          if [ -z "$NTCFGSS_FILE" ]; then
+          # Find ALL ntcfgss dat files (one per DEX in the APK)
+          NTCFGSS_FILES=$(find ../apk_extracted -name "_ntcfgss*.dat" | sort)
+          if [ -z "$NTCFGSS_FILES" ]; then
             echo "::error::No _ntcfgss*.dat file found in APK"
             exit 1
           fi
 
-          if [ -z "$NTCFG_FILE" ]; then
-            echo "::warning::_ntcfg_.data not found, will use default keys"
-            NTCFG_FILE=""
-          fi
+          echo "Found ntcfgss files:"
+          echo "$NTCFGSS_FILES"
 
-          echo "Using ntcfgss file: $NTCFGSS_FILE"
-          echo "Using ntcfg file: $NTCFG_FILE"
+          # Decrypt each DEX file
+          for NTCFGSS_FILE in $NTCFGSS_FILES; do
+            BASENAME=$(basename "$NTCFGSS_FILE")
+            # _ntcfgss.dat -> classes.dex, _ntcfgss2.dat -> classes2.dex, etc.
+            DEX_NUM=$(echo "$BASENAME" | sed 's/_ntcfgss//;s/\.dat//')
+            if [ -z "$DEX_NUM" ]; then
+              DEX_NAME="classes.dex"
+            else
+              DEX_NAME="classes${DEX_NUM}.dex"
+            fi
 
-          # Determine the classes+dex filename from the ntcfgss filename
-          BASENAME=$(basename "$NTCFGSS_FILE")
-          DEX_NUM=$(echo "$BASENAME" | sed 's/_ntcfgss//;s/\.dat//')
+            echo "Decrypting $BASENAME -> $DEX_NAME"
+            if [ -n "$NTCFG_FILE" ]; then
+              python3 ../dex_crypto_tool.py decrypt "$NTCFGSS_FILE" "$DEX_NAME" "$NTCFG_FILE"
+            else
+              python3 ../dex_crypto_tool.py decrypt "$NTCFGSS_FILE" "$DEX_NAME"
+            fi
 
-          if [ -z "$DEX_NUM" ]; then
-            DEX_NAME="classes.dex"
-          else
-            DEX_NAME="classes${DEX_NUM}.dex"
-          fi
+            if [ $? -ne 0 ]; then
+              echo "::error::Decryption failed for $BASENAME"
+              exit 1
+            fi
+            echo "Decrypted: $DEX_NAME ($(stat -c%s "$DEX_NAME") bytes)"
+          done
 
-          echo "Target DEX name: $DEX_NAME"
+          echo "All decrypted DEX files:"
+          ls -la *.dex
 
-          # Decrypt the ntcfgss file
-          if [ -n "$NTCFG_FILE" ]; then
-            python3 ../dex_crypto_tool.py decrypt "$NTCFGSS_FILE" "$DEX_NAME" "$NTCFG_FILE"
-          else
-            python3 ../dex_crypto_tool.py decrypt "$NTCFGSS_FILE" "$DEX_NAME"
-          fi
-
-          if [ $? -ne 0 ]; then
-            echo "::error::Decryption failed"
-            exit 1
-          fi
-
-          echo "Decrypted DEX: $DEX_NAME"
-          ls -la "$DEX_NAME"
-
-          # Save variables for next steps
-          echo "DEX_NAME=$DEX_NAME" >> $GITHUB_ENV
+          # Save NTCFG_FILE for later steps
           echo "NTCFG_FILE=$NTCFG_FILE" >> $GITHUB_ENV
-          echo "NTCFGSS_FILE=$NTCFGSS_FILE" >> $GITHUB_ENV
+          echo "DEX_COUNT=$(ls *.dex | wc -l)" >> $GITHUB_ENV
 
           cd ..
 
@@ -444,27 +442,36 @@ jobs:
 
           cd ..
 
-      - name: Decompile DEX to smali
+      - name: Decompile all DEX to smali
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
-          mkdir -p smali_work/smali_main smali_work/smali_core
+          mkdir -p smali_work
 
-          # Decompile the main decrypted dex
-          if [ -d "../tools/jars" ] && [ "$(ls -A ../tools/jars/*.jar 2>/dev/null)" ]; then
-            java -cp "../tools/jars/*" org.jf.baksmali.Main disassemble "$DEX_NAME" -o smali_work/smali_main
-          else
-            echo "::error::baksmali.jar not available"
-            exit 1
-          fi
+          # Decompile each decrypted DEX to its own smali subdirectory
+          for dex_file in classes*.dex; do
+            [ -f "$dex_file" ] || continue
+            # classes.dex -> smali_classes0, classes2.dex -> smali_classes1, etc.
+            if [ "$dex_file" = "classes.dex" ]; then
+              smali_dir="smali_work/smali_classes0"
+            else
+              num=$(echo "$dex_file" | sed 's/classes//;s/\.dex//')
+              smali_dir="smali_work/smali_classes${num}"
+            fi
+            mkdir -p "$smali_dir"
+            echo "Decompiling $dex_file -> $smali_dir"
+            java -cp "../tools/jars/*" org.jf.baksmali.Main disassemble "$dex_file" -o "$smali_dir"
+          done
 
-          # Decompile core_decrypted.dex if exists
+          # Also decompile core_decrypted.dex if exists
           if [ -f "core_decrypted.dex" ]; then
+            mkdir -p smali_work/smali_core
             java -cp "../tools/jars/*" org.jf.baksmali.Main disassemble core_decrypted.dex -o smali_work/smali_core
           fi
 
-          echo "Decompiled smali files"
+          echo "Decompiled smali directories:"
           ls -la smali_work/
+          echo "Total smali files: $(find smali_work -name '*.smali' | wc -l)"
 
           cd ..
 
@@ -473,37 +480,48 @@ jobs:
         run: |
           cd work
 
+          # Run modifier on the entire smali_work directory tree
           python3 ../smali_modifier.py smali_work
 
           echo "Smali modification complete"
 
           cd ..
 
-      - name: Recompile smali to DEX
+      - name: Recompile all smali to DEX
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
 
-          # Recompile smali_main
-          if [ -d "smali_work/smali_main" ]; then
-            java -cp "../tools/jars/*" org.jf.smali.Main assemble smali_work/smali_main -o classes_recompiled.dex
+          # Recompile each smali directory back to its DEX
+          for smali_dir in smali_work/smali_classes*; do
+            [ -d "$smali_dir" ] || continue
+            # smali_classes0 -> classes.dex, smali_classes1 -> classes2.dex, etc.
+            if [ "$smali_dir" = "smali_work/smali_classes0" ]; then
+              out_dex="classes.dex"
+            else
+              num=$(echo "$smali_dir" | sed 's/smali_work\/smali_classes//')
+              out_dex="classes${num}.dex"
+            fi
+            echo "Recompiling $smali_dir -> $out_dex"
+            java -cp "../tools/jars/*" org.jf.smali.Main assemble "$smali_dir" -o "$out_dex"
             if [ $? -ne 0 ]; then
-              echo "::error::Failed to recompile smali_main"
+              echo "::error::Failed to recompile $smali_dir"
               exit 1
             fi
-            echo "Recompiled smali_main to classes_recompiled.dex"
-          fi
+            echo "Recompiled: $out_dex ($(stat -c%s "$out_dex") bytes)"
+          done
 
           # Recompile smali_core if exists
           if [ -d "smali_work/smali_core" ] && [ "$(ls -A smali_work/smali_core)" ]; then
-            java -cp "../tools/jars/*" org.jf.smali.Main assemble smali_work/smali_core -o core_recompiled.dex
+            java -cp "../tools/jars/*" org.jf.smali.Main assemble smali_work/smali_core -o core.dex
             if [ $? -ne 0 ]; then
               echo "::error::Failed to recompile smali_core"
               exit 1
             fi
-            echo "Recompiled smali_core to core_recompiled.dex"
+            echo "Recompiled core.dex ($(stat -c%s core.dex) bytes)"
           fi
 
+          echo "All recompiled DEX files:"
           ls -la *.dex
 
           cd ..
@@ -516,31 +534,23 @@ jobs:
 
           NTCFG_FILE="$NTCFG_FILE"
 
-          # Encrypt all recompiled dex files
-          for dex in classes_recompiled.dex core_recompiled.dex; do
-            if [ -f "$dex" ]; then
-              OUTPUT="encrypted/${dex%.dex}_encrypted.dex"
-              if [ -n "$NTCFG_FILE" ]; then
-                python3 ../dex_crypto_tool.py encrypt "$dex" "$OUTPUT" "$NTCFG_FILE"
-              else
-                python3 ../dex_crypto_tool.py encrypt "$dex" "$OUTPUT"
-              fi
-              if [ $? -ne 0 ]; then
-                echo "::error::Failed to encrypt $dex"
-                exit 1
-              fi
-              echo "Encrypted $dex -> $OUTPUT"
-            fi
-          done
-
-          # Also encrypt the original decrypted dex if no recompilation happened
-          if [ ! -f "classes_recompiled.dex" ] && [ -f "$DEX_NAME" ]; then
+          # Encrypt all recompiled dex files with original names
+          for dex in classes*.dex core.dex; do
+            [ -f "$dex" ] || continue
+            # Skip core_decrypted.dex (input file)
+            [ "$dex" = "core_decrypted.dex" ] && continue
+            OUTPUT="encrypted/$dex"
             if [ -n "$NTCFG_FILE" ]; then
-              python3 ../dex_crypto_tool.py encrypt "$DEX_NAME" "encrypted/${DEX_NAME%.dex}_encrypted.dex" "$NTCFG_FILE"
+              python3 ../dex_crypto_tool.py encrypt "$dex" "$OUTPUT" "$NTCFG_FILE"
             else
-              python3 ../dex_crypto_tool.py encrypt "$DEX_NAME" "encrypted/${DEX_NAME%.dex}_encrypted.dex"
+              python3 ../dex_crypto_tool.py encrypt "$dex" "$OUTPUT"
             fi
-          fi
+            if [ $? -ne 0 ]; then
+              echo "::error::Failed to encrypt $dex"
+              exit 1
+            fi
+            echo "Encrypted $dex -> $OUTPUT ($(stat -c%s "$OUTPUT") bytes)"
+          done
 
           echo "Encrypted files:"
           ls -la encrypted/
@@ -552,7 +562,7 @@ jobs:
         run: |
           cd work
 
-          # Create zip with all encrypted dex files
+          # Create zip with all encrypted dex files (using original names)
           zip -j dex.zip encrypted/*.dex
 
           if [ $? -ne 0 ]; then
