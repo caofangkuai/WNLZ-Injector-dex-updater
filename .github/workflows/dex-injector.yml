@@ -49,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
            path: tools/
-           key: smali-tools-v2
+           key: smali-tools-v3
 
       - name: Download baksmali and smali
         run: |
@@ -87,14 +87,14 @@ jobs:
             echo "${tool_name} downloaded successfully"
           }
 
-           # Try multiple sources
+           # Try multiple sources (smali 2.5.2 is the latest stable release)
            download_tool "baksmali" \
-             "https://repo1.maven.org/maven2/com/android/tools/smali/baksmali/3.0.8/baksmali-3.0.8.jar" \
-             "https://github.com/JesusFreke/smali/releases/download/v3.0.8/baksmali-3.0.8.jar" || true
+             "https://repo1.maven.org/maven2/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar" \
+             "https://repo1.maven.org/maven2/com/android/tools/smali/baksmali/2.5.2/baksmali-2.5.2.jar" || true
 
            download_tool "smali" \
-             "https://repo1.maven.org/maven2/com/android/tools/smali/smali/3.0.8/smali-3.0.8.jar" \
-             "https://github.com/JesusFreke/smali/releases/download/v3.0.8/smali-3.0.8.jar" || true
+             "https://repo1.maven.org/maven2/org/smali/smali/2.5.2/smali-2.5.2.jar" \
+             "https://repo1.maven.org/maven2/com/android/tools/smali/smali/2.5.2/smali-2.5.2.jar" || true
 
           # If downloads failed, try building from source
           if [ ! -f tools/baksmali.jar ] || [ ! -f tools/smali.jar ]; then
