@@ -380,17 +380,36 @@ jobs:
           echo "ANDROID_JAR=/tmp/android.jar" >> $GITHUB_ENV
           echo "D8_CMD=java -cp /tmp/d8.jar com.android.tools.r8.D8" >> $GITHUB_ENV
 
-      - name: Compile src to core.dex or decompile existing
+      - name: Compile src to DEX or decompile existing
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
 
           D8_CMD="${{ env.D8_CMD }}"
 
+          # Find next available classes number for core.dex
+          MAX_NUM=0
+          for f in classes*.dex; do
+            [ -f "$f" ] || continue
+            if [ "$f" = "classes.dex" ]; then
+              MAX_NUM=1
+            else
+              num=$(echo "$f" | sed 's/classes//;s/\.dex//')
+              [ -n "$num" ] && [ "$num" -gt "$MAX_NUM" ] 2>/dev/null && MAX_NUM=$num
+            fi
+          done
+          NEXT_NUM=$((MAX_NUM + 1))
+          if [ "$NEXT_NUM" -eq 1 ]; then
+            CORE_DEX_NAME="classes.dex"
+          else
+            CORE_DEX_NAME="classes${NEXT_NUM}.dex"
+          fi
+          echo "Core DEX will be named: $CORE_DEX_NAME"
+
           # Check if src directory exists with Java files
           if [ -d "../src" ] && [ "$(find ../src -name '*.java' | head -1)" ]; then
             echo "src/ directory found with Java source files"
-            echo "Compiling src/ to core.dex using d8..."
+            echo "Compiling src/ to DEX using d8..."
 
             mkdir -p src_compile/classes
 
@@ -405,9 +424,9 @@ jobs:
 
             echo "Java compilation successful"
 
-            # Convert class files to DEX using d8
+            # Convert class files to DEX using d8 (min-api 28 for DEX version 038)
             CLASS_FILES=$(find src_compile/classes -name "*.class" | tr '\n' ' ')
-            $D8_CMD --output src_compile/ $CLASS_FILES 2>&1
+            $D8_CMD --min-api 28 --output src_compile/ $CLASS_FILES 2>&1
 
             if [ $? -ne 0 ] || [ ! -f "src_compile/classes.dex" ]; then
               echo "::error::d8 compilation failed"
@@ -415,29 +434,17 @@ jobs:
             fi
 
             echo "d8 compilation successful"
-            cp src_compile/classes.dex core_decrypted.dex
-            echo "Generated core.dex from src/ directory"
-            ls -la core_decrypted.dex
+            cp src_compile/classes.dex "$CORE_DEX_NAME"
+            echo "Generated $CORE_DEX_NAME from src/ directory"
+            ls -la "$CORE_DEX_NAME"
 
           elif [ -f "../core.dex" ]; then
-            echo "No src/ directory found, decompiling existing core.dex..."
-
-            # Decrypt core.dex
-            if [ -n "$NTCFG_FILE" ]; then
-              python3 ../dex_crypto_tool.py decrypt ../core.dex core_decrypted.dex "$NTCFG_FILE"
-            else
-              python3 ../dex_crypto_tool.py decrypt ../core.dex core_decrypted.dex
-            fi
-
-            if [ $? -eq 0 ]; then
-              echo "Decrypted core.dex successfully"
-              ls -la core_decrypted.dex
-            else
-              echo "Failed to decrypt core.dex"
-              exit 1
-            fi
+            echo "No src/ directory found, using existing core.dex..."
+            cp ../core.dex "$CORE_DEX_NAME"
+            echo "Copied core.dex -> $CORE_DEX_NAME"
+            ls -la "$CORE_DEX_NAME"
           else
-            echo "No src/ directory and no core.dex found, skipping core.dex handling"
+            echo "No src/ directory and no core.dex found, skipping"
           fi
 
           cd ..
@@ -462,12 +469,6 @@ jobs:
             echo "Decompiling $dex_file -> $smali_dir"
             java -cp "../tools/jars/*" org.jf.baksmali.Main disassemble "$dex_file" -o "$smali_dir"
           done
-
-          # Also decompile core_decrypted.dex if exists
-          if [ -f "core_decrypted.dex" ]; then
-            mkdir -p smali_work/smali_core
-            java -cp "../tools/jars/*" org.jf.baksmali.Main disassemble core_decrypted.dex -o smali_work/smali_core
-          fi
 
           echo "Decompiled smali directories:"
           ls -la smali_work/
@@ -511,16 +512,6 @@ jobs:
             echo "Recompiled: $out_dex ($(stat -c%s "$out_dex") bytes)"
           done
 
-          # Recompile smali_core if exists
-          if [ -d "smali_work/smali_core" ] && [ "$(ls -A smali_work/smali_core)" ]; then
-            java -cp "../tools/jars/*" org.jf.smali.Main assemble smali_work/smali_core -o core.dex
-            if [ $? -ne 0 ]; then
-              echo "::error::Failed to recompile smali_core"
-              exit 1
-            fi
-            echo "Recompiled core.dex ($(stat -c%s core.dex) bytes)"
-          fi
-
           echo "All recompiled DEX files:"
           ls -la *.dex
 
@@ -535,10 +526,8 @@ jobs:
           NTCFG_FILE="$NTCFG_FILE"
 
           # Encrypt all recompiled dex files with original names
-          for dex in classes*.dex core.dex; do
+          for dex in classes*.dex; do
             [ -f "$dex" ] || continue
-            # Skip core_decrypted.dex (input file)
-            [ "$dex" = "core_decrypted.dex" ] && continue
             OUTPUT="encrypted/$dex"
             if [ -n "$NTCFG_FILE" ]; then
               python3 ../dex_crypto_tool.py encrypt "$dex" "$OUTPUT" "$NTCFG_FILE"
