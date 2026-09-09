@@ -48,8 +48,8 @@ jobs:
       - name: Cache baksmali/smali tools
         uses: actions/cache@v4
         with:
-          path: tools/
-          key: smali-tools-v1
+           path: tools/
+           key: smali-tools-v2
 
       - name: Download baksmali and smali
         run: |
@@ -87,14 +87,14 @@ jobs:
             echo "${tool_name} downloaded successfully"
           }
 
-          # Try multiple sources
-          download_tool "baksmali" \
-            "https://github.com/JesusFreke/smali/releases/download/v3.0.8/baksmali-3.0.8.jar" \
-            "https://repo1.maven.org/maven2/org/smali/baksmali/3.0.8/baksmali-3.0.8.jar" || true
+           # Try multiple sources
+           download_tool "baksmali" \
+             "https://repo1.maven.org/maven2/com/android/tools/smali/baksmali/3.0.8/baksmali-3.0.8.jar" \
+             "https://github.com/JesusFreke/smali/releases/download/v3.0.8/baksmali-3.0.8.jar" || true
 
-          download_tool "smali" \
-            "https://github.com/JesusFreke/smali/releases/download/v3.0.8/smali-3.0.8.jar" \
-            "https://repo1.maven.org/maven2/org/smali/smali/3.0.8/smali-3.0.8.jar" || true
+           download_tool "smali" \
+             "https://repo1.maven.org/maven2/com/android/tools/smali/smali/3.0.8/smali-3.0.8.jar" \
+             "https://github.com/JesusFreke/smali/releases/download/v3.0.8/smali-3.0.8.jar" || true
 
           # If downloads failed, try building from source
           if [ ! -f tools/baksmali.jar ] || [ ! -f tools/smali.jar ]; then
@@ -397,7 +397,8 @@ jobs:
             echo "Java compilation successful"
 
             # Convert class files to DEX using d8
-            $D8_CMD --output src_compile/ src_compile/classes/*.class 2>&1
+            CLASS_FILES=$(find src_compile/classes -name "*.class" | tr '\n' ' ')
+            $D8_CMD --output src_compile/ $CLASS_FILES 2>&1
 
             if [ $? -ne 0 ] || [ ! -f "src_compile/classes.dex" ]; then
               echo "::error::d8 compilation failed"
