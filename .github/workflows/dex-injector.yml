@@ -235,7 +235,7 @@ jobs:
         run: |
           APK_URL="${{ steps.resolve.outputs.apk_url }}"
           echo "Downloading APK from: $APK_URL"
-          wget -q -O app.apk "$APK_URL"
+          wget --progress=dot:giga -O app.apk "$APK_URL"
           ls -la app.apk
 
       - name: Get version and extract files
@@ -252,8 +252,8 @@ jobs:
             VERSION=$(python3 -c "
           from androguard.core.apk import APK
           apk = APK('app.apk')
-          name = apk.get_version_name()
-          code = apk.get_version_code()
+          name = apk.get_androidversion_name()
+          code = apk.get_androidversion_code()
           if name and code:
               print(f'{name}_{code}')
           else:

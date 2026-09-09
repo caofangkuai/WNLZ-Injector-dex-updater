@@ -1,51 +1,56 @@
-# WNLZ Injector DEX Updater
+# WNLZ Injector DEX 自动更新器
 
-Automated workflow that decrypts, modifies, and re-encrypts DEX files from NetEase Minecraft APK to inject the WNZ LZ Injector plugin loader.
+自动化工作流：从网易我的世界 APK 中解密 DEX 文件，注入 WNZ LZ Injector 插件加载器，重新加密后发布到目标仓库。
 
-## How It Works
+## 工作流程
 
-1. **Download** the latest APK (or use a provided URL)
-2. **Extract** encrypted DEX files from APK assets
-3. **Decrypt** DEX files using NetEase Yidun decryption (XOR-based)
-4. **Decompile** DEX to smali via baksmali
-5. **Modify** smali to add `Inject.inject()` call in `handleOnApplicationOnCreate`
-6. **Compile** Java source from `src/` to `core.dex` via d8 (or decompile existing core.dex)
-7. **Recompile** smali back to DEX via smali
-8. **Encrypt** DEX files and package as `dex.zip`
-9. **Release** to a target GitHub repository
+1. **下载**最新版 APK（或指定 URL）
+2. **从 APK 中提取**加密的 DEX 文件
+3. **解密** DEX 文件（网易易盾 XOR 加密）
+4. **反编译** DEX 为 smali
+5. **修改** smali：在 `handleOnApplicationOnCreate` 中插入 `Inject.inject()` 调用
+6. **编译** `src/` 中的 Java 源码为 `core.dex`（或解密现有的 core.dex）
+7. **重新编译** smali 为 DEX
+8. **加密** DEX 文件并打包为 `dex.zip`
+9. **发布**到目标 GitHub 仓库
 
-## Trigger Modes
+## 触发方式
 
-- **Push**: Triggered by changes to `.py`, `core.dex`, `src/**`, or workflow files
-- **Scheduled**: Every 7 days via cron
-- **Manual**: `workflow_dispatch` with optional APK URL and version inputs
+- **Push 触发**：`.py`、`core.dex`、`src/**`、`.github/workflows/**` 文件变更时
+- **定时触发**：每 7 天执行一次
+- **手动触发**：`workflow_dispatch`，可指定 APK URL 和版本号
 
-## Secrets
+## 密钥配置
 
-| Secret | Description |
-|--------|-------------|
-| `TARGET_REPO` | Target repository for releases (format: `owner/repo`) |
-| `ACCESS_TOKEN` | GitHub personal access token with `contents:write` permission |
+| 密钥 | 说明 |
+|------|------|
+| `TARGET_REPO` | 发布到的目标仓库（格式: `owner/repo`） |
+| `ACCESS_TOKEN` | GitHub 个人访问令牌，需要 `contents:write` 权限 |
 
-## File Structure
+## 目录结构
 
 ```
 .
-├── .github/workflows/dex-injector.yml   # Main workflow
-├── dex_crypto_tool.py                   # DEX encrypt/decrypt tool
-├── smali_modifier.py                    # Smali injection script
-├── src/                                 # Java source for core.dex
+├── .github/workflows/dex-injector.yml   # 主工作流
+├── dex_crypto_tool.py                   # DEX 加密/解密工具
+├── smali_modifier.py                    # Smali 注入脚本
+├── src/                                 # core.dex 的 Java 源码
 │   └── com/wunelezi/injector/Inject.java
-└── core.dex                             # Compiled DEX (gitignored)
+└── core.dex                             # 编译后的 DEX（不纳入版本控制）
 ```
 
-## Requirements
+## 依赖说明
 
-- `src/` directory with Java source containing `com.wunelezi.injector.Inject` class
-- baksmali/smali jars (auto-downloaded and cached)
-- Android build tools: `d8` and `android.jar` (auto-downloaded and cached)
+- `src/` 目录需包含 `com.wunelezi.injector.Inject` 类
+- baksmali/smali jar（自动下载并缓存）
+- Android 构建工具：`d8` 和 `android.jar`（自动下载并缓存）
+- androguard（用于解析 AndroidManifest.xml 获取版本号）
 
-## Notes
+## 版本号格式
 
-- If a release with `dex.zip` already exists, the workflow skips (except when triggered by `core.dex` update)
-- The `Inject` class loads plugin ZIPs from `plugins.txt` in external storage and injects them via `DexClassLoader`
+格式为 `版本名称_版本号`，例如 `3.9.15.297907_840297907`，从 APK 的 AndroidManifest.xml 中自动提取。
+
+## 注意事项
+
+- 如果目标仓库已存在包含 `dex.zip` 的 release，则跳过处理（core.dex 更新触发除外）
+- `Inject` 类从外部存储的 `plugins.txt` 读取插件列表，通过 `DexClassLoader` 加载
