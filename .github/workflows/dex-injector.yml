@@ -51,57 +51,68 @@ jobs:
            path: tools/
            key: smali-tools-v3
 
-      - name: Download baksmali and smali
+      - name: Download baksmali and smali with dependencies
         run: |
           mkdir -p tools
 
-           # Function to download with fallback
-           download_tool() {
-             local tool_name=$1
-             local primary_url=$2
-             local fallback_url=$3
-             local output_file="tools/${tool_name}.jar"
+          # Create a minimal POM to resolve all dependencies via Maven
+          cat > tools/pom.xml << 'POMEOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project>
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>temp</groupId>
+            <artifactId>temp</artifactId>
+            <version>1.0</version>
+            <dependencies>
+              <dependency>
+                <groupId>org.smali</groupId>
+                <artifactId>baksmali</artifactId>
+                <version>2.5.2</version>
+              </dependency>
+              <dependency>
+                <groupId>org.smali</groupId>
+                <artifactId>smali</artifactId>
+                <version>2.5.2</version>
+              </dependency>
+            </dependencies>
+          </project>
+          POMEOF
 
-             if [ -f "$output_file" ] && [ -s "$output_file" ]; then
-               echo "${tool_name}.jar already cached"
-               return 0
-             fi
-
-             echo "Downloading ${tool_name}..."
-             curl -sL --max-time 60 "$primary_url" -o "$output_file" || true
-
-             # Verify it's a valid JAR (check ZIP magic bytes: PK)
-             if [ ! -s "$output_file" ] || ! head -c 2 "$output_file" | grep -q "PK"; then
-               echo "Primary download failed, trying fallback..."
-               rm -f "$output_file"
-               curl -sL --max-time 60 "$fallback_url" -o "$output_file" || true
-             fi
-
-             # Final verification
-             if [ ! -s "$output_file" ] || ! head -c 2 "$output_file" | grep -q "PK"; then
-               echo "::error::Failed to download ${tool_name}"
-               rm -f "$output_file"
-               return 1
-             fi
-
-             echo "${tool_name} downloaded successfully"
-           }
-
-           # Try multiple sources (smali 2.5.2 is the latest stable release)
-           download_tool "baksmali" \
-             "https://repo1.maven.org/maven2/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar" \
-             "https://repo1.maven.org/maven2/com/android/tools/smali/baksmali/2.5.2/baksmali-2.5.2.jar" || true
-
-           download_tool "smali" \
-             "https://repo1.maven.org/maven2/org/smali/smali/2.5.2/smali-2.5.2.jar" \
-             "https://repo1.maven.org/maven2/com/android/tools/smali/smali/2.5.2/smali-2.5.2.jar" || true
-
-          # If downloads failed, try building from source
-          if [ ! -f tools/baksmali.jar ] || [ ! -f tools/smali.jar ]; then
-            echo "Pre-built jars not available, will use alternative approach"
+          # Use Maven to download all dependencies (including transitive)
+          if command -v mvn &> /dev/null; then
+            cd tools && mvn -q dependency:copy-Dependencies -DoutputDirectory=jars && cd ..
+          else
+            # Fallback: download Maven wrapper and use it
+            curl -sL "https://repo1.maven.org/maven2/io/takari/maven-wrapper/0.5.6/maven-wrapper-0.5.6.jar" -o tools/maven-wrapper.jar
+            # Manual download of known dependencies
+            for url in \
+              "https://repo1.maven.org/maven2/org/smali/baksmali/2.5.2/baksmali-2.5.2.jar" \
+              "https://repo1.maven.org/maven2/org/smali/smali/2.5.2/smali-2.5.2.jar" \
+              "https://repo1.maven.org/maven2/org/smali/dexlib2/2.5.2/dexlib2-2.5.2.jar" \
+              "https://repo1.maven.org/maven2/org/smali/util/2.5.2/util-2.5.2.jar" \
+              "https://repo1.maven.org/maven2/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar" \
+              "https://repo1.maven.org/maven2/com/beust/jcommander/1.82/jcommander-1.82.jar" \
+              "https://repo1.maven.org/maven2/com/google/code/findbugs/jsr305/3.0.2/jsr305-3.0.2.jar" \
+              "https://repo1.maven.org/maven2/com/google/guava/failureaccess/1.0.1/failureaccess-1.0.1.jar" \
+              "https://repo1.maven.org/maven2/org/checkerframework/checker-qual/3.12.0/checker-qual-3.12.0.jar" \
+              "https://repo1.maven.org/maven2/com/google/errorprone/error_prone_annotations/2.11.0/error_prone_annotations-2.11.0.jar" \
+              "https://repo1.maven.org/maven2/com/google/j2objc/j2objc-annotations/1.3/j2objc-annotations-1.3.jar"; do
+              fname=$(basename "$url")
+              curl -sL --max-time 60 "$url" -o "tools/jars/$fname" || echo "Warning: failed to download $fname"
+            done
           fi
 
-          ls -la tools/
+          # Verify key jars exist
+          for jar in baksmali.jar smali.jar; do
+            if [ ! -f "tools/jars/$jar" ]; then
+              # Check if it's directly in tools/
+              if [ -f "tools/$jar" ]; then
+                mkdir -p tools/jars && mv tools/*.jar tools/jars/ 2>/dev/null || true
+              fi
+            fi
+          done
+
+          ls -la tools/jars/ 2>/dev/null || ls -la tools/
 
       - name: Install dependencies
         run: |
@@ -440,8 +451,8 @@ jobs:
           mkdir -p smali_work/smali_main smali_work/smali_core
 
           # Decompile the main decrypted dex
-          if [ -f "../tools/baksmali.jar" ] && [ -s "../tools/baksmali.jar" ]; then
-            java -cp ../tools/baksmali.jar org.jf.baksmali.Main disassemble "$DEX_NAME" -o smali_work/smali_main
+          if [ -d "../tools/jars" ] && [ "$(ls -A ../tools/jars/*.jar 2>/dev/null)" ]; then
+            java -cp "../tools/jars/*" org.jf.baksmali.Main disassemble "$DEX_NAME" -o smali_work/smali_main
           else
             echo "::error::baksmali.jar not available"
             exit 1
@@ -449,7 +460,7 @@ jobs:
 
           # Decompile core_decrypted.dex if exists
           if [ -f "core_decrypted.dex" ]; then
-            java -cp ../tools/baksmali.jar org.jf.baksmali.Main disassemble core_decrypted.dex -o smali_work/smali_core
+            java -cp "../tools/jars/*" org.jf.baksmali.Main disassemble core_decrypted.dex -o smali_work/smali_core
           fi
 
           echo "Decompiled smali files"
@@ -475,7 +486,7 @@ jobs:
 
           # Recompile smali_main
           if [ -d "smali_work/smali_main" ]; then
-            java -cp ../tools/smali.jar org.jf.smali.Main assemble smali_work/smali_main -o classes_recompiled.dex
+            java -cp "../tools/jars/*" org.jf.smali.Main assemble smali_work/smali_main -o classes_recompiled.dex
             if [ $? -ne 0 ]; then
               echo "::error::Failed to recompile smali_main"
               exit 1
@@ -485,7 +496,7 @@ jobs:
 
           # Recompile smali_core if exists
           if [ -d "smali_work/smali_core" ] && [ "$(ls -A smali_work/smali_core)" ]; then
-            java -cp ../tools/smali.jar org.jf.smali.Main assemble smali_work/smali_core -o core_recompiled.dex
+            java -cp "../tools/jars/*" org.jf.smali.Main assemble smali_work/smali_core -o core_recompiled.dex
             if [ $? -ne 0 ]; then
               echo "::error::Failed to recompile smali_core"
               exit 1
