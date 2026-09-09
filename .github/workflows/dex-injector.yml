@@ -80,7 +80,7 @@ jobs:
 
           # Use Maven to download all dependencies (including transitive)
           if command -v mvn &> /dev/null; then
-            cd tools && mvn -q dependency:copy-Dependencies -DoutputDirectory=jars && cd ..
+            cd tools && mvn -q dependency:copy-dependencies -DoutputDirectory=jars && cd ..
           else
             # Fallback: download Maven wrapper and use it
             curl -sL "https://repo1.maven.org/maven2/io/takari/maven-wrapper/0.5.6/maven-wrapper-0.5.6.jar" -o tools/maven-wrapper.jar
