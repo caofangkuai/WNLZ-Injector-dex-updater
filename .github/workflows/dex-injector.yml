@@ -441,7 +441,7 @@ jobs:
 
           # Decompile the main decrypted dex
           if [ -f "../tools/baksmali.jar" ] && [ -s "../tools/baksmali.jar" ]; then
-            java -jar ../tools/baksmali.jar disassemble "$DEX_NAME" -o smali_work/smali_main
+            java -cp ../tools/baksmali.jar org.smali.baksmali.Main disassemble "$DEX_NAME" -o smali_work/smali_main
           else
             echo "::error::baksmali.jar not available"
             exit 1
@@ -449,7 +449,7 @@ jobs:
 
           # Decompile core_decrypted.dex if exists
           if [ -f "core_decrypted.dex" ]; then
-            java -jar ../tools/baksmali.jar disassemble core_decrypted.dex -o smali_work/smali_core
+            java -cp ../tools/baksmali.jar org.smali.baksmali.Main disassemble core_decrypted.dex -o smali_work/smali_core
           fi
 
           echo "Decompiled smali files"
@@ -475,7 +475,7 @@ jobs:
 
           # Recompile smali_main
           if [ -d "smali_work/smali_main" ]; then
-            java -jar ../tools/smali.jar assemble smali_work/smali_main -o classes_recompiled.dex
+            java -cp ../tools/smali.jar org.smali.smali.Main assemble smali_work/smali_main -o classes_recompiled.dex
             if [ $? -ne 0 ]; then
               echo "::error::Failed to recompile smali_main"
               exit 1
@@ -485,7 +485,7 @@ jobs:
 
           # Recompile smali_core if exists
           if [ -d "smali_work/smali_core" ] && [ "$(ls -A smali_work/smali_core)" ]; then
-            java -jar ../tools/smali.jar assemble smali_work/smali_core -o core_recompiled.dex
+            java -cp ../tools/smali.jar org.smali.smali.Main assemble smali_work/smali_core -o core_recompiled.dex
             if [ $? -ne 0 ]; then
               echo "::error::Failed to recompile smali_core"
               exit 1
