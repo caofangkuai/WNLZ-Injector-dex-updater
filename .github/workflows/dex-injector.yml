@@ -302,6 +302,7 @@ jobs:
 
       - name: Compile src to DEX
         if: env.SKIP_REMAINING != 'true'
+        id: compile_src
         run: |
           cd work
 
@@ -325,6 +326,7 @@ jobs:
             CORE_DEX_NAME="classes${NEXT_NUM}.dex"
           fi
           echo "Core DEX will be named: $CORE_DEX_NAME"
+          echo "core_dex_name=$CORE_DEX_NAME" >> $GITHUB_OUTPUT
 
           if [ -d "../src" ] && [ "$(find ../src -name '*.java' | head -1)" ]; then
             echo "Compiling src/ to DEX using d8..."
@@ -467,7 +469,7 @@ jobs:
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
-          python3 ../scripts/generate_plugin_maker.py ../core.dex "../tools/jars/*" ../plugin-maker.jar com/wunelezi
+          python3 ../scripts/generate_plugin_maker.py "${{ steps.compile_src.outputs.core_dex_name }}" "../tools/jars/*" ../plugin-maker.jar com/wunelezi
           ls -la plugin-maker.jar
           jar tf plugin-maker.jar
 
