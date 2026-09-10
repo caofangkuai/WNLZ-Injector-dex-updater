@@ -64,8 +64,17 @@ def strip_smali_to_public_api(smali_path, output_path):
                 method_is_public = False
             if method_is_public:
                 output.append(line)
-                # Add minimal stub body
-                output.append('    .registers 0\n')
+                # Calculate needed registers
+                is_static = 'static' in stripped
+                # Parse parameter count from method signature
+                # .method public static inject(Landroid/app/Application;)V
+                param_match = re.search(r'\(([^)]*)\)', stripped)
+                param_count = 0
+                if param_match and param_match.group(1):
+                    param_count = len(re.findall(r'\[*[LJZBSCIFD]', param_match.group(1)))
+                # Static: params only, Non-static: this + params
+                registers = param_count if is_static else param_count + 1
+                output.append(f'    .registers {registers}\n')
                 output.append('\n')
                 output.append('    return-void\n')
                 output.append('.end method\n')
@@ -140,8 +149,8 @@ def main():
                 if not f.endswith('.smali'):
                     continue
                 src_path = os.path.join(root, f)
-                # Maintain relative structure
-                rel_path = os.path.relpath(src_path, pkg_dir)
+                # Maintain full package path relative to smali_dir
+                rel_path = os.path.relpath(src_path, smali_dir)
                 dst_path = os.path.join(stripped_dir, rel_path)
                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
                 strip_smali_to_public_api(src_path, dst_path)
