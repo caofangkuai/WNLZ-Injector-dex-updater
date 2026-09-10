@@ -467,18 +467,7 @@ jobs:
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
-          mkdir -p plugin_stub/com/wunelezi/injector
-          cat > plugin_stub/com/wunelezi/injector/Inject.java << 'JAVAEOF'
-          package com.wunelezi.injector;
-          import android.app.Application;
-          public class Inject {
-              public static void inject(Application application) {}
-          }
-          JAVAEOF
-          javac --release 8 -classpath "${{ env.ANDROID_JAR }}" plugin_stub/com/wunelezi/injector/Inject.java
-          cd plugin_stub && jar cf ../plugin-maker.jar com/wunelezi/injector/Inject.class
-          cd ..
-          echo "plugin-maker.jar created"
+          python3 ../scripts/generate_plugin_maker.py ../src ../plugin-maker.jar "${{ env.ANDROID_JAR }}"
           ls -la plugin-maker.jar
           jar tf plugin-maker.jar
 
