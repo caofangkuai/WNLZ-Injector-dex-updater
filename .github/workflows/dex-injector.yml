@@ -467,7 +467,7 @@ jobs:
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
-          python3 ../scripts/generate_plugin_maker.py ../src ../plugin-maker.jar "${{ env.ANDROID_JAR }}"
+          python3 ../scripts/generate_plugin_maker.py ../core.dex "../tools/jars/*" ../plugin-maker.jar com/wunelezi
           ls -la plugin-maker.jar
           jar tf plugin-maker.jar
 
