@@ -105,7 +105,6 @@ jobs:
           # Verify key jars exist
           for jar in baksmali.jar smali.jar; do
             if [ ! -f "tools/jars/$jar" ]; then
-              # Check if it's directly in tools/
               if [ -f "tools/$jar" ]; then
                 mkdir -p tools/jars && mv tools/*.jar tools/jars/ 2>/dev/null || true
               fi
@@ -121,81 +120,10 @@ jobs:
 
       - name: Resolve APK URL
         id: resolve
-        run: |
-          python3 << 'PYEOF'
-          import os
-          import re
-          import requests
-          import sys
-
-          apk_url_input = "${{ inputs.apk_url }}"
-          version_input = "${{ inputs.version }}"
-
-          # Get trigger event name
-          trigger_event = os.environ.get("GITHUB_EVENT_NAME", "")
-
-          # Determine if triggered by core.dex update
-          is_core_dex_trigger = False
-          if trigger_event == "push":
-              import subprocess
-              result = subprocess.run(
-                  ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
-                  capture_output=True, text=True
-              )
-              changed_files = result.stdout.strip().split("\n")
-              if "core.dex" in changed_files:
-                  is_core_dex_trigger = True
-
-          print(f"Trigger event: {trigger_event}")
-          print(f"Is core.dex trigger: {is_core_dex_trigger}")
-
-          apk_url = None
-
-          if apk_url_input:
-              apk_url = apk_url_input
-          else:
-              # Auto-detect from API
-              print("Auto-detecting latest APK URL...")
-              try:
-                  resp = requests.get("https://adl.netease.com/d/g/mc/c/gwnew?type=android", timeout=30)
-                  resp.raise_for_status()
-                  content = resp.text
-
-                  for line in content.split("\n"):
-                      line = line.strip()
-                      if 'var android_link = android_type ? "' in line:
-                          match = re.search(r'var android_link = android_type \? "([^"]+)"', line)
-                          if match:
-                              apk_url = match.group(1)
-                              break
-
-                  if not apk_url:
-                      for line in content.split("\n"):
-                          line = line.strip()
-                          if 'android_link' in line and 'http' in line:
-                              urls = re.findall(r'https?://[^\s"\']+', line)
-                              if urls:
-                                  apk_url = urls[0]
-                                  break
-
-                  if not apk_url:
-                      print("::error::Failed to find APK URL in API response")
-                      sys.exit(1)
-
-                  print(f"Found APK URL: {apk_url}")
-
-              except Exception as e:
-                  print(f"::error::Failed to auto-detect APK URL: {e}")
-                  sys.exit(1)
-
-          # Output results
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"apk_url={apk_url}\n")
-              f.write(f"version_input={version_input}\n")
-              f.write(f"is_core_dex_trigger={str(is_core_dex_trigger).lower()}\n")
-
-          print(f"apk_url={apk_url}")
-          PYEOF
+        env:
+          INPUT_APK_URL: ${{ inputs.apk_url }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: python3 scripts/resolve_apk_url.py
 
       - name: Check if release already exists
         id: check_release
@@ -217,7 +145,6 @@ jobs:
 
           if [ "$HTTP_CODE" = "200" ]; then
             echo "Release $VERSION already exists"
-            # Check if dex.zip asset exists
             ASSET_EXISTS=$(curl -s \
               -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
               "https://api.github.com/repos/$TARGET_REPO/releases/tags/$VERSION" | \
@@ -282,7 +209,6 @@ jobs:
           mkdir -p apk_extracted/assets
           unzip -o app.apk "assets/_ntcfg_.data" "assets/_ntcfgss*.dat" -d apk_extracted 2>/dev/null || true
 
-          # Fallback: try root if not in assets
           if [ ! -f "apk_extracted/assets/_ntcfg_.data" ] && [ ! -f "apk_extracted/_ntcfg_.data" ]; then
             unzip -o app.apk "_ntcfg_.data" "_ntcfgss*.dat" -d apk_extracted 2>/dev/null || true
           fi
@@ -302,7 +228,6 @@ jobs:
             echo "::warning::_ntcfg_.data not found, will use default keys"
           fi
 
-          # Find ALL ntcfgss dat files (one per DEX in the APK)
           NTCFGSS_FILES=$(find ../apk_extracted -name "_ntcfgss*.dat" | sort)
           if [ -z "$NTCFGSS_FILES" ]; then
             echo "::error::No _ntcfgss*.dat file found in APK"
@@ -312,10 +237,8 @@ jobs:
           echo "Found ntcfgss files:"
           echo "$NTCFGSS_FILES"
 
-          # Decrypt each DEX file
           for NTCFGSS_FILE in $NTCFGSS_FILES; do
             BASENAME=$(basename "$NTCFGSS_FILE")
-            # _ntcfgss.dat -> classes.dex, _ntcfgss2.dat -> classes2.dex, etc.
             DEX_NUM=$(echo "$BASENAME" | sed 's/_ntcfgss//;s/\.dat//')
             if [ -z "$DEX_NUM" ]; then
               DEX_NAME="classes.dex"
@@ -340,7 +263,6 @@ jobs:
           echo "All decrypted DEX files:"
           ls -la *.dex
 
-          # Save NTCFG_FILE for later steps
           echo "NTCFG_FILE=$NTCFG_FILE" >> $GITHUB_ENV
           echo "DEX_COUNT=$(ls *.dex | wc -l)" >> $GITHUB_ENV
 
@@ -358,12 +280,10 @@ jobs:
       - name: Download android.jar and d8
         if: env.SKIP_REMAINING != 'true' && steps.cache-android.outputs.cache-hit != 'true'
         run: |
-          # Download android.jar stub from Sable's mirror
           curl -sL --max-time 120 \
             "https://github.com/Sable/android-platforms/raw/master/android-34/android.jar" \
             -o /tmp/android.jar
 
-          # Download d8 from build-tools R34 and extract d8.jar
           curl -sL --max-time 120 \
             "https://dl.google.com/android/repository/build-tools_r34-linux.zip" \
             -o /tmp/d8.zip
@@ -380,14 +300,14 @@ jobs:
           echo "ANDROID_JAR=/tmp/android.jar" >> $GITHUB_ENV
           echo "D8_CMD=java -cp /tmp/d8.jar com.android.tools.r8.D8" >> $GITHUB_ENV
 
-      - name: Compile src to DEX or decompile existing
+      - name: Compile src to DEX
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
 
           D8_CMD="${{ env.D8_CMD }}"
 
-          # Find next available classes number for core.dex
+          # Find next available classes number
           MAX_NUM=0
           for f in classes*.dex; do
             [ -f "$f" ] || continue
@@ -406,14 +326,11 @@ jobs:
           fi
           echo "Core DEX will be named: $CORE_DEX_NAME"
 
-          # Check if src directory exists with Java files
           if [ -d "../src" ] && [ "$(find ../src -name '*.java' | head -1)" ]; then
-            echo "src/ directory found with Java source files"
             echo "Compiling src/ to DEX using d8..."
 
             mkdir -p src_compile/classes
 
-            # Compile Java source to class files
             find ../src -name '*.java' > src_compile/sources.txt
             javac -source 1.8 -target 1.8 -bootclasspath "${{ env.ANDROID_JAR }}" -d src_compile/classes @src_compile/sources.txt 2>&1
 
@@ -424,9 +341,9 @@ jobs:
 
             echo "Java compilation successful"
 
-            # Convert class files to DEX using d8 (min-api 28 for DEX version 038)
+            # min-api 26 for DEX version 035
             CLASS_FILES=$(find src_compile/classes -name "*.class" | tr '\n' ' ')
-            $D8_CMD --min-api 28 --output src_compile/ $CLASS_FILES 2>&1
+            $D8_CMD --min-api 26 --output src_compile/ $CLASS_FILES 2>&1
 
             if [ $? -ne 0 ] || [ ! -f "src_compile/classes.dex" ]; then
               echo "::error::d8 compilation failed"
@@ -439,9 +356,8 @@ jobs:
             ls -la "$CORE_DEX_NAME"
 
           elif [ -f "../core.dex" ]; then
-            echo "No src/ directory found, using existing core.dex..."
+            echo "Using existing core.dex..."
             cp ../core.dex "$CORE_DEX_NAME"
-            echo "Copied core.dex -> $CORE_DEX_NAME"
             ls -la "$CORE_DEX_NAME"
           else
             echo "No src/ directory and no core.dex found, skipping"
@@ -455,10 +371,8 @@ jobs:
           cd work
           mkdir -p smali_work
 
-          # Decompile each decrypted DEX to its own smali subdirectory
           for dex_file in classes*.dex; do
             [ -f "$dex_file" ] || continue
-            # classes.dex -> smali_classes0, classes2.dex -> smali_classes1, etc.
             if [ "$dex_file" = "classes.dex" ]; then
               smali_dir="smali_work/smali_classes0"
             else
@@ -480,12 +394,8 @@ jobs:
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
-
-          # Run modifier on the entire smali_work directory tree
           python3 ../smali_modifier.py smali_work
-
           echo "Smali modification complete"
-
           cd ..
 
       - name: Recompile all smali to DEX
@@ -493,10 +403,8 @@ jobs:
         run: |
           cd work
 
-          # Recompile each smali directory back to its DEX
           for smali_dir in smali_work/smali_classes*; do
             [ -d "$smali_dir" ] || continue
-            # smali_classes0 -> classes.dex, smali_classes1 -> classes2.dex, etc.
             if [ "$smali_dir" = "smali_work/smali_classes0" ]; then
               out_dex="classes.dex"
             else
@@ -504,7 +412,7 @@ jobs:
               out_dex="classes${num}.dex"
             fi
             echo "Recompiling $smali_dir -> $out_dex"
-            java -cp "../tools/jars/*" org.jf.smali.Main assemble "$smali_dir" -o "$out_dex"
+            java -cp "../tools/jars/*" org.jf.smali.Main assemble --api 26 "$smali_dir" -o "$out_dex"
             if [ $? -ne 0 ]; then
               echo "::error::Failed to recompile $smali_dir"
               exit 1
@@ -525,7 +433,6 @@ jobs:
 
           NTCFG_FILE="$NTCFG_FILE"
 
-          # Encrypt all recompiled dex files with original names
           for dex in classes*.dex; do
             [ -f "$dex" ] || continue
             OUTPUT="encrypted/$dex"
@@ -550,20 +457,38 @@ jobs:
         if: env.SKIP_REMAINING != 'true'
         run: |
           cd work
-
-          # Create zip with all encrypted dex files (using original names)
           zip -j dex.zip encrypted/*.dex
-
-          if [ $? -ne 0 ]; then
-            echo "::error::Failed to create dex.zip"
-            exit 1
-          fi
-
           echo "Created dex.zip:"
           ls -la dex.zip
           unzip -l dex.zip
-
           cd ..
+
+      - name: Create plugin-maker.jar
+        if: env.SKIP_REMAINING != 'true'
+        run: |
+          cd work
+          mkdir -p plugin_stub/com/wunelezi/injector
+          cat > plugin_stub/com/wunelezi/injector/Inject.java << 'JAVAEOF'
+          package com.wunelezi.injector;
+          import android.app.Application;
+          public class Inject {
+              public static void inject(Application application) {}
+          }
+          JAVAEOF
+          javac --release 8 -classpath "${{ env.ANDROID_JAR }}" plugin_stub/com/wunelezi/injector/Inject.java
+          cd plugin_stub && jar cf ../plugin-maker.jar com/wunelezi/injector/Inject.class
+          cd ..
+          echo "plugin-maker.jar created"
+          ls -la plugin-maker.jar
+          jar tf plugin-maker.jar
+
+      - name: Upload DEX artifact
+        if: env.SKIP_REMAINING != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: modified-dex-${{ steps.manifest_version.outputs.version }}
+          path: work/classes*.dex
+          retention-days: 7
 
       - name: Upload release asset
         if: env.SKIP_REMAINING != 'true'
@@ -583,7 +508,6 @@ jobs:
 
           if [ "$HTTP_CODE" != "200" ]; then
             echo "Creating release $VERSION..."
-            # Create release
             CREATE_RESPONSE=$(curl -s -X POST \
               -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
               -H "Content-Type: application/json" \
@@ -606,7 +530,6 @@ jobs:
 
             echo "Created release with ID: $RELEASE_ID"
           else
-            # Get existing release ID
             RELEASE_ID=$(curl -s \
               -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
               "https://api.github.com/repos/$TARGET_REPO/releases/tags/$VERSION" | \
@@ -615,36 +538,38 @@ jobs:
             echo "Using existing release with ID: $RELEASE_ID"
           fi
 
-          # Delete existing dex.zip asset if exists
-          EXISTING_ASSET=$(curl -s \
-            -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
-            "https://api.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets" | \
-            python3 -c "import sys,json; assets=json.load(sys.stdin); result=[a['id'] for a in assets if a['name']=='dex.zip']; print(result[0] if result else '')" 2>/dev/null)
-
-          if [ -n "$EXISTING_ASSET" ]; then
-            echo "Deleting existing asset ID: $EXISTING_ASSET"
-            curl -s -X DELETE \
+          # Delete existing assets
+          for ASSET_NAME in dex.zip plugin-maker.jar; do
+            EXISTING_ASSET=$(curl -s \
               -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
-              "https://api.github.com/repos/$TARGET_REPO/releases/assets/$EXISTING_ASSET"
-          fi
+              "https://api.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets" | \
+              python3 -c "import sys,json; assets=json.load(sys.stdin); result=[a['id'] for a in assets if a['name']=='$ASSET_NAME']; print(result[0] if result else '')" 2>/dev/null)
+
+            if [ -n "$EXISTING_ASSET" ]; then
+              echo "Deleting existing $ASSET_NAME (ID: $EXISTING_ASSET)"
+              curl -s -X DELETE \
+                -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+                "https://api.github.com/repos/$TARGET_REPO/releases/assets/$EXISTING_ASSET"
+            fi
+          done
 
           # Upload dex.zip
           echo "Uploading dex.zip..."
-          UPLOAD_RESPONSE=$(curl -s -X POST \
+          curl -s -X POST \
             -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
             -H "Content-Type: application/zip" \
             --data-binary @work/dex.zip \
-            "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=dex.zip")
+            "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=dex.zip"
 
-          echo "Upload response: $UPLOAD_RESPONSE"
+          # Upload plugin-maker.jar
+          echo "Uploading plugin-maker.jar..."
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
+            -H "Content-Type: application/java-archive" \
+            --data-binary @work/plugin-maker.jar \
+            "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=plugin-maker.jar"
 
-          # Verify upload
-          if echo "$UPLOAD_RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); assert 'id' in r" 2>/dev/null; then
-            echo "Successfully uploaded dex.zip to release $VERSION"
-          else
-            echo "::error::Failed to upload dex.zip"
-            exit 1
-          fi
+          echo "Upload complete"
 
       - name: Cleanup
         if: always() && env.SKIP_REMAINING != 'true'
