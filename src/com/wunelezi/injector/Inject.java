@@ -41,15 +41,14 @@ public final class Inject {
 
     private static final int BUFFER_SIZE = 4096;
 
-    /**
-     * info.json 读取上限(字符数)。
-     * 设为 0 或负数表示不限制(完整读取)。
-     * 默认 -1:完整读取,不截断。
-     */
+    /** info.json 读取上限(字符);<=0 表示完整读取。 */
     private static final int MAX_INFO_JSON_CHARS = -1;
 
     /** 防止重复注入,避免 dexElements 无限膨胀。 */
     private static final Set<String> sInjectedPlugins = new HashSet<>();
+
+    /** 记录已经合并进宿主的 dex 绝对路径,防止同一 dex 被重复注册。 */
+    private static final Set<String> sRegisteredDexPaths = new HashSet<>();
 
     private Inject() {}
 
@@ -80,7 +79,7 @@ public final class Inject {
             while ((line = reader.readLine()) != null) {
                 String trimmed = line.trim();
                 if (trimmed.isEmpty() || trimmed.startsWith("#")) {
-                    continue; // 支持注释
+                    continue;
                 }
                 File pluginZip = new File(externalFilesDir, trimmed);
                 try {
@@ -115,7 +114,7 @@ public final class Inject {
             sInjectedPlugins.add(pluginKey);
         }
 
-        // 1. 读取 info.json 里的 init 类名(完整读取)
+        // 1. 读取 info.json 里的 init 类名
         String initClassName = readInitClassFromZip(pluginZip);
         if (initClassName == null || initClassName.isEmpty()) {
             log("No init class found in " + INFO_ENTRY_NAME + " for: " + pluginKey);
@@ -123,7 +122,7 @@ public final class Inject {
         }
         log("Init class: " + initClassName);
 
-        // 2. 加载并合并 dex(宿主在前,插件在后)
+        // 2. 加载并合并 dex 到宿主 ClassLoader
         List<File> loadedDexFiles = loadAllDexFromZip(pluginZip, application);
         if (loadedDexFiles.isEmpty()) {
             log("No " + DEX_SUFFIX + " entries found in: " + pluginKey);
@@ -131,14 +130,14 @@ public final class Inject {
         }
         log("Loaded " + loadedDexFiles.size() + " dex file(s) from: " + pluginKey);
 
-        // 3. 调用 onInject
+        // 3. 用宿主 ClassLoader 加载 init 类(dex 已合并进去)
         Object result = invokeOnInit(initClassName, pluginZip, application);
         if (result == null) {
             log("onInject returned null for " + initClassName);
             return;
         }
 
-        // 4. 若返回 ActivityLifecycleCallbacks,则注册
+        // 4. 注册 ActivityLifecycleCallbacks
         if (result instanceof Application.ActivityLifecycleCallbacks) {
             application.registerActivityLifecycleCallbacks(
                     (Application.ActivityLifecycleCallbacks) result);
@@ -150,7 +149,7 @@ public final class Inject {
     }
 
     // =====================================================================
-    // dex 加载与合并
+    // dex 加载与合并(方案 B)
     // =====================================================================
 
     private static List<File> loadAllDexFromZip(File pluginZip, Application application) {
@@ -175,15 +174,26 @@ public final class Inject {
                 File outputFile = new File(dexDir,
                         "plugin_" + Math.abs(pluginZip.getAbsolutePath().hashCode())
                                 + "_" + new File(entryName).getName());
+
+                // 同一个 dex 路径已经注册过,跳过(避免 ART 多 loader 注册报错)
+                String outputPath = outputFile.getAbsolutePath();
+                synchronized (sRegisteredDexPaths) {
+                    if (sRegisteredDexPaths.contains(outputPath)) {
+                        log("Dex already registered, skip: " + outputPath);
+                        result.add(outputFile);
+                        continue;
+                    }
+                }
+
                 if (extractEntry(zipFile, entry, outputFile)) {
                     extractedDexFiles.add(outputFile);
                     result.add(outputFile);
-                    log("Extracted dex entry: " + entryName + " -> " + outputFile.getAbsolutePath());
+                    log("Extracted dex entry: " + entryName + " -> " + outputPath);
                 }
             }
 
             if (!extractedDexFiles.isEmpty()) {
-                // 一次 DexClassLoader + 一次 merge,避免 dexElements 膨胀
+                // 一次 DexClassLoader + 一次 merge
                 StringBuilder dexPath = new StringBuilder();
                 for (File f : extractedDexFiles) {
                     if (dexPath.length() > 0) {
@@ -191,12 +201,22 @@ public final class Inject {
                     }
                     dexPath.append(f.getAbsolutePath());
                 }
+
                 DexClassLoader pluginLoader = new DexClassLoader(
                         dexPath.toString(),
                         dexDir.getAbsolutePath(),
                         null,
                         hostLoader);
-                combineDexElements(pluginLoader, hostLoader);
+
+                // 关键:合并后断开 pluginLoader 对 dex 的引用
+                combineDexElementsAndDetach(pluginLoader, hostLoader);
+
+                // 记录已注册路径
+                synchronized (sRegisteredDexPaths) {
+                    for (File f : extractedDexFiles) {
+                        sRegisteredDexPaths.add(f.getAbsolutePath());
+                    }
+                }
             }
         } catch (Throwable th) {
             log("Failed to enumerate dex from: " + pluginZip.getAbsolutePath());
@@ -227,10 +247,15 @@ public final class Inject {
     }
 
     /**
-     * 将 sourceLoader 的 dexElements 追加到 targetLoader 之后。
-     * 宿主在前、插件在后,避免插件覆盖宿主同名类。
+     * 方案 B 的核心:
+     *   1. 把 sourceLoader 的 dexElements 追加到 targetLoader 后面(宿主在前,插件在后)
+     *   2. 立即把 sourceLoader 的 dexElements 置空
+     *
+     * 第 2 步是必须的,否则 ART 会报:
+     *   InternalError: Attempt to register dex file ... with multiple class loaders
      */
-    private static void combineDexElements(ClassLoader sourceLoader, ClassLoader targetLoader) {
+    private static void combineDexElementsAndDetach(ClassLoader sourceLoader,
+                                                    ClassLoader targetLoader) {
         try {
             Field pathListField = Class.forName("dalvik.system.BaseDexClassLoader")
                     .getDeclaredField("pathList");
@@ -250,17 +275,30 @@ public final class Inject {
             Object[] sourceElements = (Object[]) dexElementsField.get(sourcePathList);
             Object[] targetElements = (Object[]) dexElementsField.get(targetPathList);
 
+            if (sourceElements.length == 0) {
+                log("No dex elements to combine");
+                return;
+            }
+
             Object[] combined = (Object[]) Array.newInstance(
                     targetElements.getClass().getComponentType(),
                     targetElements.length + sourceElements.length);
 
             // 宿主在前,插件在后
             System.arraycopy(targetElements, 0, combined, 0, targetElements.length);
-            System.arraycopy(sourceElements, 0, combined, targetElements.length, sourceElements.length);
+            System.arraycopy(sourceElements, 0, combined, targetElements.length,
+                    sourceElements.length);
 
             dexElementsField.set(targetPathList, combined);
             log("Combined " + sourceElements.length + " plugin dex element(s) after "
                     + targetElements.length + " host element(s)");
+
+            // ★★★ 关键:断开 sourceLoader 对 dex 的引用
+            Object[] emptyElements = (Object[]) Array.newInstance(
+                    sourceElements.getClass().getComponentType(), 0);
+            dexElementsField.set(sourcePathList, emptyElements);
+            log("Detached source loader dex elements to avoid ART multi-loader conflict");
+
         } catch (Throwable th) {
             log("Failed to combine dex elements");
             logThrowable(th);
@@ -268,7 +306,7 @@ public final class Inject {
     }
 
     // =====================================================================
-    // info.json 读取(完整读取)
+    // info.json 读取
     // =====================================================================
 
     private static String readInitClassFromZip(File pluginZip) {
@@ -280,8 +318,6 @@ public final class Inject {
             }
             try (Reader reader = new InputStreamReader(
                     zipFile.getInputStream(infoEntry), StandardCharsets.UTF_8)) {
-
-                // 完整读取,不截断(除非显式配置了上限)
                 String content = readFully(reader, MAX_INFO_JSON_CHARS);
                 if (content == null) {
                     log("Failed to read " + INFO_ENTRY_NAME + " fully: "
@@ -297,22 +333,15 @@ public final class Inject {
         }
     }
 
-    /**
-     * 完整读取 Reader 的全部内容。
-     *
-     * @param maxChars 上限(字符数);<=0 表示不限制,完整读取。
-     * @return 读取到的字符串;若超过上限则返回 null。
-     */
     private static String readFully(Reader reader, int maxChars) throws IOException {
         StringBuilder sb = new StringBuilder(1024);
         char[] buf = new char[BUFFER_SIZE];
         int n;
         while ((n = reader.read(buf)) != -1) {
             if (maxChars > 0 && sb.length() + n > maxChars) {
-                // 读到了上限:再多读一个字符确认是否真的还有内容
                 int extra = reader.read();
                 if (extra != -1) {
-                    return null; // 确实超过上限
+                    return null;
                 }
                 sb.append(buf, 0, n);
                 break;
@@ -336,14 +365,9 @@ public final class Inject {
     // 反射调用 onInject
     // =====================================================================
 
-    /**
-     * 支持以下四种签名(按优先级):
-     *   1) static  onInject(File, Application)
-     *   2) instance onInject(File, Application)
-     *   3) static  onInject(Application)
-     *   4) instance onInject(Application)
-     */
-    private static Object invokeOnInit(String className, File pluginZip, Application application) {
+    private static Object invokeOnInit(String className, File pluginZip,
+                                       Application application) {
+        // 方案 B:dex 已合并进宿主,直接用宿主 ClassLoader 加载
         ClassLoader loader = Inject.class.getClassLoader();
         try {
             Class<?> initClass = Class.forName(className, true, loader);
