@@ -465,14 +465,6 @@ jobs:
           unzip -l dex.zip
           cd ..
 
-      - name: Create plugin-maker.jar
-        if: env.SKIP_REMAINING != 'true'
-        run: |
-          cd work
-          python3 ../scripts/generate_plugin_maker.py "${{ steps.compile_src.outputs.core_dex_name }}" "../tools/jars/*" plugin-maker.jar com/wunelezi
-          ls -la plugin-maker.jar
-          jar tf plugin-maker.jar
-
       - name: Upload DEX artifact
         if: env.SKIP_REMAINING != 'true'
         uses: actions/upload-artifact@v4
@@ -530,7 +522,7 @@ jobs:
           fi
 
           # Delete existing assets
-          for ASSET_NAME in dex.zip plugin-maker.jar; do
+          for ASSET_NAME in dex.zip; do
             EXISTING_ASSET=$(curl -s \
               -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
               "https://api.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets" | \
@@ -551,14 +543,6 @@ jobs:
             -H "Content-Type: application/zip" \
             --data-binary @work/dex.zip \
             "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=dex.zip"
-
-          # Upload plugin-maker.jar
-          echo "Uploading plugin-maker.jar..."
-          curl -s -X POST \
-            -H "Authorization: token ${{ secrets.ACCESS_TOKEN }}" \
-            -H "Content-Type: application/java-archive" \
-            --data-binary @work/plugin-maker.jar \
-            "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=plugin-maker.jar"
 
           echo "Upload complete"
 
