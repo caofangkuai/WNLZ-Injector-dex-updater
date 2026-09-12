@@ -13,6 +13,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.lang.reflect.Array;
+import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -22,6 +24,8 @@ import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -35,6 +39,7 @@ public final class Inject {
     private static final String DEX_DIR_NAME      = "wnlz_dex";
     private static final String INFO_ENTRY_NAME   = "info.json";
     private static final String INFO_KEY_INIT     = "init";
+    private static final String INFO_KEY_MERGE_DEX = "mergeDex";
     private static final String DEX_SUFFIX        = ".dex";
 
     private static final int BUFFER_SIZE = 4096;
@@ -42,13 +47,39 @@ public final class Inject {
     /** info.json 读取上限(字符);<=0 表示完整读取。 */
     private static final int MAX_INFO_JSON_CHARS = -1;
 
+    /** 是否清理 wnlz_dex 目录下的旧 dex(仅在本进程首次注入时执行)。 */
+    private static final boolean CLEAN_DEX_DIR_BEFORE_INJECT = true;
+
+    /** 本进程是否已执行过目录清理,保证多次注入只清一次。 */
+    private static final AtomicBoolean sCleanedOnce = new AtomicBoolean(false);
+
     /** 防止同一插件被重复注入。 */
     private static final Set<String> sInjectedPlugins = new HashSet<>();
 
-    /** 缓存每个插件的 DexClassLoader,避免重复创建。 */
-    private static final Set<String> sCreatedDexPaths = new HashSet<>();
+    /** 已解压的 dex 绝对路径(本次进程内)。 */
+    private static final Set<String> sExtractedDexPaths = new HashSet<>();
+
+    /** 方案 B:已合并进宿主的 dex 绝对路径,防止重复注册。 */
+    private static final Set<String> sRegisteredDexPaths = new HashSet<>();
+
+    /** 全局唯一序号,保证同一进程内每次解压文件名不重复。 */
+    private static final AtomicInteger sDexSeq = new AtomicInteger(0);
 
     private Inject() {}
+
+    // =====================================================================
+    // 插件配置
+    // =====================================================================
+
+    private static final class PluginInfo {
+        final String initClassName;
+        final boolean mergeDex;
+
+        PluginInfo(String initClassName, boolean mergeDex) {
+            this.initClassName = initClassName;
+            this.mergeDex = mergeDex;
+        }
+    }
 
     // =====================================================================
     // 入口
@@ -64,6 +95,11 @@ public final class Inject {
         if (externalFilesDir == null) {
             log("inject: externalFilesDir is null");
             return;
+        }
+
+        // 只在本进程首次注入时清理一次
+        if (CLEAN_DEX_DIR_BEFORE_INJECT && sCleanedOnce.compareAndSet(false, true)) {
+            cleanDexDir(application);
         }
 
         File pluginListFile = new File(externalFilesDir, PLUGIN_LIST_FILE);
@@ -93,6 +129,28 @@ public final class Inject {
         }
     }
 
+    /** 清理 wnlz_dex 目录,避免旧 dex 无限堆积。 */
+    private static void cleanDexDir(Application application) {
+        File dexDir = application.getDir(DEX_DIR_NAME, 0);
+        if (!dexDir.exists() || !dexDir.isDirectory()) {
+            return;
+        }
+        File[] files = dexDir.listFiles();
+        if (files == null) {
+            return;
+        }
+        int deleted = 0;
+        for (File f : files) {
+            if (f.isFile() && f.getName().endsWith(DEX_SUFFIX)) {
+                if (f.delete()) {
+                    deleted++;
+                }
+            }
+        }
+        log("First inject in this process, cleaned " + deleted
+                + " old dex file(s) in " + dexDir.getAbsolutePath());
+    }
+
     // =====================================================================
     // 单个插件处理
     // =====================================================================
@@ -112,59 +170,206 @@ public final class Inject {
             sInjectedPlugins.add(pluginKey);
         }
 
-        // 1. 读取 info.json 里的 init 类名
-        String initClassName = readInitClassFromZip(pluginZip);
-        if (initClassName == null || initClassName.isEmpty()) {
+        PluginInfo info = readPluginInfoFromZip(pluginZip);
+        if (info == null || info.initClassName == null || info.initClassName.isEmpty()) {
             log("No init class found in " + INFO_ENTRY_NAME + " for: " + pluginKey);
             return;
         }
-        log("Init class: " + initClassName);
+        log("Init class: " + info.initClassName + ", mergeDex=" + info.mergeDex);
 
-        // 2. 为这个插件构建一个 DexClassLoader(不合并到宿主)
-        DexClassLoader pluginLoader = buildPluginClassLoader(pluginZip, application);
-        if (pluginLoader == null) {
-            log("Failed to build DexClassLoader for: " + pluginKey);
+        ClassLoader classLoaderForPlugin;
+        if (info.mergeDex) {
+            boolean merged = mergePluginDexToHost(pluginZip, application);
+            if (!merged) {
+                log("mergeDex=true but merge failed, fallback to Plan A for: " + pluginKey);
+                classLoaderForPlugin = buildPluginClassLoader(pluginZip, application);
+            } else {
+                classLoaderForPlugin = Inject.class.getClassLoader();
+            }
+        } else {
+            classLoaderForPlugin = buildPluginClassLoader(pluginZip, application);
+        }
+
+        if (classLoaderForPlugin == null) {
+            log("Failed to build ClassLoader for: " + pluginKey);
             return;
         }
 
-        // 3. 用插件自己的 DexClassLoader 加载 init 类
-        Object result = invokeOnInit(initClassName, pluginZip, application, pluginLoader);
+        Object result = invokeOnInit(info.initClassName, pluginZip, application,
+                classLoaderForPlugin);
         if (result == null) {
-            log("onInject returned null for " + initClassName);
+            log("onInject returned null for " + info.initClassName);
             return;
         }
 
-        // 4. 注册 ActivityLifecycleCallbacks
         if (result instanceof Application.ActivityLifecycleCallbacks) {
             application.registerActivityLifecycleCallbacks(
                     (Application.ActivityLifecycleCallbacks) result);
-            log("Registered ActivityLifecycleCallbacks from " + initClassName);
+            log("Registered ActivityLifecycleCallbacks from " + info.initClassName);
         } else {
-            log("onInject returned non-lifecycle object for " + initClassName
+            log("onInject returned non-lifecycle object for " + info.initClassName
                     + ": " + result.getClass().getName());
         }
     }
 
     // =====================================================================
-    // 构建插件 ClassLoader(方案 A 核心)
+    // 方案 A:构建插件自己的 DexClassLoader(不合并)
     // =====================================================================
 
-    /**
-     * 解压 zip 里所有 .dex 到私有目录,构建一个 DexClassLoader。
-     * parent 使用 Inject 所在的 ClassLoader(即宿主 ClassLoader)。
-     *
-     * 不做任何 dexElements 合并,插件类只由这个 pluginLoader 加载;
-     * 插件需要引用宿主类时,双亲委派会把请求交给 hostLoader。
-     */
     private static DexClassLoader buildPluginClassLoader(File pluginZip,
                                                         Application application) {
+        List<File> dexFiles = extractAllDex(pluginZip, application, "a");
+        if (dexFiles.isEmpty()) {
+            log("Plan A: no " + DEX_SUFFIX + " entries in " + pluginZip.getAbsolutePath());
+            return null;
+        }
+
         File dexDir = application.getDir(DEX_DIR_NAME, 0);
         ClassLoader hostLoader = Inject.class.getClassLoader();
 
-        try (ZipFile zipFile = new ZipFile(pluginZip)) {
-            List<File> extractedDexFiles = new ArrayList<>();
-            Enumeration<? extends ZipEntry> entries = zipFile.entries();
+        StringBuilder dexPath = new StringBuilder();
+        for (File f : dexFiles) {
+            if (dexPath.length() > 0) {
+                dexPath.append(File.pathSeparator);
+            }
+            dexPath.append(f.getAbsolutePath());
+        }
 
+        DexClassLoader pluginLoader = new DexClassLoader(
+                dexPath.toString(),
+                dexDir.getAbsolutePath(),
+                null,
+                hostLoader);
+
+        log("Plan A: built DexClassLoader with " + dexFiles.size()
+                + " dex file(s), parent=" + hostLoader);
+        return pluginLoader;
+    }
+
+    // =====================================================================
+    // 方案 B:合并 dex 到宿主 ClassLoader
+    // =====================================================================
+
+    private static boolean mergePluginDexToHost(File pluginZip, Application application) {
+        List<File> dexFiles = extractAllDex(pluginZip, application, "b");
+        if (dexFiles.isEmpty()) {
+            log("Plan B: no " + DEX_SUFFIX + " entries in " + pluginZip.getAbsolutePath());
+            return false;
+        }
+
+        List<File> toMerge = new ArrayList<>();
+        synchronized (sRegisteredDexPaths) {
+            for (File f : dexFiles) {
+                if (sRegisteredDexPaths.contains(f.getAbsolutePath())) {
+                    log("Plan B: dex already registered, skip: " + f.getAbsolutePath());
+                    continue;
+                }
+                toMerge.add(f);
+            }
+        }
+        if (toMerge.isEmpty()) {
+            log("Plan B: all dex already registered, nothing to merge");
+            return true;
+        }
+
+        File dexDir = application.getDir(DEX_DIR_NAME, 0);
+        ClassLoader hostLoader = Inject.class.getClassLoader();
+
+        StringBuilder dexPath = new StringBuilder();
+        for (File f : toMerge) {
+            if (dexPath.length() > 0) {
+                dexPath.append(File.pathSeparator);
+            }
+            dexPath.append(f.getAbsolutePath());
+        }
+
+        try {
+            DexClassLoader pluginLoader = new DexClassLoader(
+                    dexPath.toString(),
+                    dexDir.getAbsolutePath(),
+                    null,
+                    hostLoader);
+
+            boolean ok = combineDexElementsAndDetach(pluginLoader, hostLoader);
+            if (ok) {
+                synchronized (sRegisteredDexPaths) {
+                    for (File f : toMerge) {
+                        sRegisteredDexPaths.add(f.getAbsolutePath());
+                    }
+                }
+                log("Plan B: merged " + toMerge.size() + " dex file(s) into host");
+            }
+            return ok;
+        } catch (Throwable th) {
+            log("Plan B: failed to merge dex");
+            logThrowable(th);
+            return false;
+        }
+    }
+
+    private static boolean combineDexElementsAndDetach(ClassLoader sourceLoader,
+                                                       ClassLoader targetLoader) {
+        try {
+            Field pathListField = Class.forName("dalvik.system.BaseDexClassLoader")
+                    .getDeclaredField("pathList");
+            pathListField.setAccessible(true);
+
+            Object sourcePathList = pathListField.get(sourceLoader);
+            Object targetPathList = pathListField.get(targetLoader);
+            if (sourcePathList == null || targetPathList == null) {
+                log("Plan B: pathList is null, cannot combine");
+                return false;
+            }
+
+            Field dexElementsField = Class.forName("dalvik.system.DexPathList")
+                    .getDeclaredField("dexElements");
+            dexElementsField.setAccessible(true);
+
+            Object[] sourceElements = (Object[]) dexElementsField.get(sourcePathList);
+            Object[] targetElements = (Object[]) dexElementsField.get(targetPathList);
+
+            if (sourceElements.length == 0) {
+                log("Plan B: no dex elements to combine");
+                return false;
+            }
+
+            Object[] combined = (Object[]) Array.newInstance(
+                    targetElements.getClass().getComponentType(),
+                    targetElements.length + sourceElements.length);
+            System.arraycopy(targetElements, 0, combined, 0, targetElements.length);
+            System.arraycopy(sourceElements, 0, combined, targetElements.length,
+                    sourceElements.length);
+
+            dexElementsField.set(targetPathList, combined);
+            log("Plan B: combined " + sourceElements.length
+                    + " plugin element(s) after " + targetElements.length
+                    + " host element(s)");
+
+            Object[] emptyElements = (Object[]) Array.newInstance(
+                    sourceElements.getClass().getComponentType(), 0);
+            dexElementsField.set(sourcePathList, emptyElements);
+            log("Plan B: detached source loader dex elements");
+            return true;
+
+        } catch (Throwable th) {
+            log("Plan B: failed to combine dex elements");
+            logThrowable(th);
+            return false;
+        }
+    }
+
+    // =====================================================================
+    // dex 解压(方案 A/B 共用)
+    // =====================================================================
+
+    private static List<File> extractAllDex(File pluginZip,
+                                            Application application,
+                                            String planTag) {
+        List<File> result = new ArrayList<>();
+        File dexDir = application.getDir(DEX_DIR_NAME, 0);
+
+        try (ZipFile zipFile = new ZipFile(pluginZip)) {
+            Enumeration<? extends ZipEntry> entries = zipFile.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
                 String entryName = entry.getName();
@@ -175,58 +380,39 @@ public final class Inject {
                     continue;
                 }
 
-                File outputFile = new File(dexDir,
-                        "plugin_" + Math.abs(pluginZip.getAbsolutePath().hashCode())
-                                + "_" + new File(entryName).getName());
+                int seq = sDexSeq.incrementAndGet();
+                long ts = System.currentTimeMillis();
+                String baseName = new File(entryName).getName();
+                String uniqueName = "plugin_"
+                        + planTag + "_"
+                        + Math.abs(pluginZip.getAbsolutePath().hashCode()) + "_"
+                        + seq + "_"
+                        + ts + "_"
+                        + baseName;
+                File outputFile = new File(dexDir, uniqueName);
 
-                synchronized (sCreatedDexPaths) {
-                    if (sCreatedDexPaths.contains(outputFile.getAbsolutePath())) {
+                synchronized (sExtractedDexPaths) {
+                    if (sExtractedDexPaths.contains(outputFile.getAbsolutePath())) {
                         log("Dex already extracted, reuse: " + outputFile.getAbsolutePath());
-                        extractedDexFiles.add(outputFile);
+                        result.add(outputFile);
                         continue;
                     }
                 }
 
                 if (extractEntry(zipFile, entry, outputFile)) {
-                    extractedDexFiles.add(outputFile);
-                    synchronized (sCreatedDexPaths) {
-                        sCreatedDexPaths.add(outputFile.getAbsolutePath());
+                    result.add(outputFile);
+                    synchronized (sExtractedDexPaths) {
+                        sExtractedDexPaths.add(outputFile.getAbsolutePath());
                     }
-                    log("Extracted dex entry: " + entryName
+                    log("Extracted dex entry [" + planTag + "]: " + entryName
                             + " -> " + outputFile.getAbsolutePath());
                 }
             }
-
-            if (extractedDexFiles.isEmpty()) {
-                log("No " + DEX_SUFFIX + " entries found in: " + pluginZip.getAbsolutePath());
-                return null;
-            }
-
-            // 拼所有 dex 路径
-            StringBuilder dexPath = new StringBuilder();
-            for (File f : extractedDexFiles) {
-                if (dexPath.length() > 0) {
-                    dexPath.append(File.pathSeparator);
-                }
-                dexPath.append(f.getAbsolutePath());
-            }
-
-            // 关键:parent = hostLoader,插件类需要宿主类时走双亲委派
-            DexClassLoader pluginLoader = new DexClassLoader(
-                    dexPath.toString(),
-                    dexDir.getAbsolutePath(),
-                    null,          // librarySearchPath,插件无 so 可传 null
-                    hostLoader);
-
-            log("Built DexClassLoader with " + extractedDexFiles.size()
-                    + " dex file(s), parent=" + hostLoader);
-            return pluginLoader;
-
         } catch (Throwable th) {
-            log("Failed to build DexClassLoader from: " + pluginZip.getAbsolutePath());
+            log("Failed to extract dex from: " + pluginZip.getAbsolutePath());
             logThrowable(th);
-            return null;
         }
+        return result;
     }
 
     private static boolean extractEntry(ZipFile zipFile, ZipEntry entry, File outputFile) {
@@ -254,7 +440,7 @@ public final class Inject {
     // info.json 读取
     // =====================================================================
 
-    private static String readInitClassFromZip(File pluginZip) {
+    private static PluginInfo readPluginInfoFromZip(File pluginZip) {
         try (ZipFile zipFile = new ZipFile(pluginZip)) {
             ZipEntry infoEntry = zipFile.getEntry(INFO_ENTRY_NAME);
             if (infoEntry == null) {
@@ -269,7 +455,7 @@ public final class Inject {
                             + pluginZip.getAbsolutePath());
                     return null;
                 }
-                return parseInitFromJson(content);
+                return parsePluginInfo(content);
             }
         } catch (Throwable th) {
             log("Failed to read " + INFO_ENTRY_NAME + " from: " + pluginZip.getAbsolutePath());
@@ -296,11 +482,14 @@ public final class Inject {
         return sb.toString();
     }
 
-    private static String parseInitFromJson(String json) {
+    private static PluginInfo parsePluginInfo(String json) {
         try {
-            return new JSONObject(json).optString(INFO_KEY_INIT, null);
+            JSONObject obj = new JSONObject(json);
+            String init = obj.optString(INFO_KEY_INIT, null);
+            boolean mergeDex = obj.optBoolean(INFO_KEY_MERGE_DEX, false);
+            return new PluginInfo(init, mergeDex);
         } catch (Throwable th) {
-            log("Failed to parse " + INFO_KEY_INIT + " from " + INFO_ENTRY_NAME);
+            log("Failed to parse " + INFO_ENTRY_NAME);
             logThrowable(th);
             return null;
         }
@@ -310,15 +499,6 @@ public final class Inject {
     // 反射调用 onInject
     // =====================================================================
 
-    /**
-     * 支持以下四种签名(按优先级):
-     *   1) static  onInject(File, Application)
-     *   2) instance onInject(File, Application)
-     *   3) static  onInject(Application)
-     *   4) instance onInject(Application)
-     *
-     * 方案 A:用传入的 pluginLoader 加载 init 类,而不是宿主 loader。
-     */
     private static Object invokeOnInit(String className, File pluginZip,
                                        Application application,
                                        ClassLoader pluginLoader) {
